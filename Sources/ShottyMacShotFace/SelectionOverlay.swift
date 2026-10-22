@@ -287,6 +287,24 @@ final class SelectionDrawView: NSView {
         let offset = CGPoint(x: (global.x - src.minX) / spanPts * size, y: (global.y - src.minY) / spanPts * size)
         let cellRect = CGRect(x: m.minX + (offset.x / cell).rounded(.down) * cell,
                               y: m.minY + (offset.y / cell).rounded(.down) * cell, width: cell, height: cell)
+        // Greenshot-style crosshair: lines across the whole lens through the centre of the pointer's
+        // pixel, stopping just short of it so the pixel itself stays visible. Each line is drawn twice
+        // (a wide light one under a thin dark one) so it shows on both light and dark content.
+        let c = CGPoint(x: cellRect.midX, y: cellRect.midY)
+        let gap = cell / 2 + 2
+        let arms: [(CGPoint, CGPoint)] = [
+            (CGPoint(x: m.minX, y: c.y), CGPoint(x: c.x - gap, y: c.y)),
+            (CGPoint(x: c.x + gap, y: c.y), CGPoint(x: m.maxX, y: c.y)),
+            (CGPoint(x: c.x, y: m.minY), CGPoint(x: c.x, y: c.y - gap)),
+            (CGPoint(x: c.x, y: c.y + gap), CGPoint(x: c.x, y: m.maxY)),
+        ]
+        for (color, width) in [(NSColor.white.withAlphaComponent(0.85), CGFloat(3)),
+                               (NSColor.systemRed, CGFloat(1))] {
+            ctx.setStrokeColor(color.cgColor)
+            ctx.setLineWidth(width)
+            for (a, b) in arms { ctx.move(to: a); ctx.addLine(to: b) }
+            ctx.strokePath()
+        }
         ctx.setStrokeColor(NSColor.systemRed.cgColor); ctx.setLineWidth(1.5)
         ctx.stroke(cellRect)
         ctx.restoreGState()
