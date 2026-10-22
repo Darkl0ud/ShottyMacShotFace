@@ -289,7 +289,7 @@ final class SelectionDrawView: NSView {
                               y: m.minY + (offset.y / cell).rounded(.down) * cell, width: cell, height: cell)
         // Greenshot-style crosshair: lines across the whole lens through the centre of the pointer's
         // pixel, stopping just short of it so the pixel itself stays visible. Each line is drawn twice
-        // (a wide light one under a thin dark one) so it shows on both light and dark content.
+        // (a wide white halo under a thin black line) so it shows on both light and dark content.
         let c = CGPoint(x: cellRect.midX, y: cellRect.midY)
         let gap = cell / 2 + 2
         let arms: [(CGPoint, CGPoint)] = [
@@ -299,7 +299,7 @@ final class SelectionDrawView: NSView {
             (CGPoint(x: c.x, y: c.y + gap), CGPoint(x: c.x, y: m.maxY)),
         ]
         for (color, width) in [(NSColor.white.withAlphaComponent(0.85), CGFloat(3)),
-                               (NSColor.systemRed, CGFloat(1))] {
+                               (NSColor.black, CGFloat(1))] {
             ctx.setStrokeColor(color.cgColor)
             ctx.setLineWidth(width)
             for (a, b) in arms { ctx.move(to: a); ctx.addLine(to: b) }
