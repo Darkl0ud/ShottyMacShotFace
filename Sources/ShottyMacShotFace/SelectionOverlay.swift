@@ -51,6 +51,9 @@ final class SelectionOverlay {
             windows.append(w)
         }
         NSApp.activate(ignoringOtherApps: true)
+        // After a warp macOS ignores real mouse movement for 0.25 s by default, which would make
+        // Shift-precision movement stutter. Turn that pause off while the overlay is up.
+        CGEventSource(stateID: .combinedSessionState)?.localEventsSuppressionInterval = 0
         cursor = mouseLocation()
         let start = windows.first { $0.frame.contains(NSEvent.mouseLocation) } ?? windows.first
         start?.makeKey()
@@ -67,27 +70,54 @@ final class SelectionOverlay {
         for w in windows { (w.contentView as? SelectionContainerView)?.drawView.needsDisplay = true }
     }
 
+    // MARK: Precision (hold Shift)
+
+    /// Pointer speed while Shift is held.
+    static let precisionFactor: CGFloat = 0.25
+    /// Moves the real on-screen pointer. Swappable so the self-test doesn't move Warren's mouse.
+    var warp: (CGPoint) -> Void = { p in
+        CGWarpMouseCursorPosition(p)
+        CGAssociateMouseAndMouseCursorPosition(1)
+    }
+
+    /// Normally the selection follows the real pointer. With Shift held, we move our own cursor by a
+    /// fraction of the hand's movement (the event's raw delta) and put the real pointer there, so what
+    /// you see is always what gets selected. Letting go of Shift simply resumes following the pointer.
+    func track(_ e: NSEvent?) {
+        guard let e, e.modifierFlags.contains(.shift) else {
+            cursor = mouseLocation()
+            return
+        }
+        let k = Self.precisionFactor
+        var p = CGPoint(x: cursor.x + e.deltaX * k, y: cursor.y + e.deltaY * k) // deltaY is already y-down
+        p.x = min(max(p.x, snapshot.frame.minX), snapshot.frame.maxX - 1)
+        p.y = min(max(p.y, snapshot.frame.minY), snapshot.frame.maxY - 1)
+        cursor = p
+        warp(p)
+    }
+
     // MARK: Events (forwarded from the views)
 
-    func mouseMoved() {
-        cursor = mouseLocation()
+    func mouseMoved(_ e: NSEvent? = nil) {
+        track(e)
         if dragStart == nil { updateHover() }
         refresh()
     }
 
-    func mouseDown() {
-        cursor = mouseLocation()
+    func mouseDown(_ e: NSEvent? = nil) {
+        // A click doesn't move the pointer: keep the precise position if Shift is down.
+        if !(e?.modifierFlags.contains(.shift) ?? false) { cursor = mouseLocation() }
         if mode == .region { dragStart = cursor }
         refresh()
     }
 
-    func mouseDragged() {
-        cursor = mouseLocation()
+    func mouseDragged(_ e: NSEvent? = nil) {
+        track(e)
         refresh()
     }
 
-    func mouseUp() {
-        cursor = mouseLocation()
+    func mouseUp(_ e: NSEvent? = nil) {
+        if !(e?.modifierFlags.contains(.shift) ?? false) { cursor = mouseLocation() }
         switch mode {
         case .region:
             if let r = selectionRect, r.width >= 3, r.height >= 3 {
@@ -125,8 +155,7 @@ final class SelectionOverlay {
             case 125: p.y += step
             default: p.y -= step
             }
-            CGWarpMouseCursorPosition(p)
-            CGAssociateMouseAndMouseCursorPosition(1)
+            warp(p)
             cursor = p
             if dragStart == nil { updateHover() }
             refresh()
@@ -197,10 +226,10 @@ final class SelectionDrawView: NSView {
     override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
     override func cursorUpdate(with event: NSEvent) { NSCursor.crosshair.set() }
 
-    override func mouseMoved(with event: NSEvent) { NSCursor.crosshair.set(); overlay?.mouseMoved() }
-    override func mouseDown(with event: NSEvent) { overlay?.mouseDown() }
-    override func mouseDragged(with event: NSEvent) { overlay?.mouseDragged() }
-    override func mouseUp(with event: NSEvent) { overlay?.mouseUp() }
+    override func mouseMoved(with event: NSEvent) { NSCursor.crosshair.set(); overlay?.mouseMoved(event) }
+    override func mouseDown(with event: NSEvent) { overlay?.mouseDown(event) }
+    override func mouseDragged(with event: NSEvent) { overlay?.mouseDragged(event) }
+    override func mouseUp(with event: NSEvent) { overlay?.mouseUp(event) }
     override func rightMouseDown(with event: NSEvent) { overlay?.finish(.cancelled) }
     override func keyDown(with event: NSEvent) { overlay?.keyDown(event) }
 
@@ -321,7 +350,7 @@ final class SelectionDrawView: NSView {
 
     private func drawHint(_ mode: SelectionOverlay.Mode, ctx: CGContext) {
         let text = mode == .region
-            ? "Drag to select · click a window to take its area · Space: window mode · arrows nudge · Esc: cancel"
+            ? "Drag to select · hold ⇧ to move slowly · click a window to take its area · Space: window mode · arrows nudge · Esc: cancel"
             : "Click a window to capture it · Space: region mode · Esc: cancel"
         drawLabel(text, near: CGPoint(x: bounds.midX, y: 28), ctx: ctx, below: true, centered: true)
     }

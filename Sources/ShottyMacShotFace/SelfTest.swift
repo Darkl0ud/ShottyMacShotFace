@@ -320,6 +320,24 @@ final class SelfTest: NSObject, NSApplicationDelegate {
             }, name)
         }
         let probe = SelectionOverlay(snapshot: snap, mode: .region, showMagnifier: false)
+        do {
+            var warped: CGPoint?
+            probe.warp = { warped = $0 } // never move the real mouse during the test
+            probe.cursor = CGPoint(x: 300, y: 200)
+            func moved(dx: Int64, dy: Int64, shift: Bool) -> NSEvent? {
+                guard let cg = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                                       mouseCursorPosition: .zero, mouseButton: .left) else { return nil }
+                cg.setIntegerValueField(.mouseEventDeltaX, value: dx)
+                cg.setIntegerValueField(.mouseEventDeltaY, value: dy)
+                if shift { cg.flags = .maskShift }
+                return NSEvent(cgEvent: cg)
+            }
+            probe.track(moved(dx: 40, dy: 20, shift: true))
+            check(probe.cursor == CGPoint(x: 310, y: 205) && warped == probe.cursor,
+                  "⇧ moves the selection cursor at 25% speed (40,20 → +\(probe.cursor.x - 300),+\(probe.cursor.y - 200)) and puts the pointer there")
+            probe.track(moved(dx: -3000, dy: 0, shift: true)) // delta field is 16-bit, keep it realistic
+            check(probe.cursor.x == snap.frame.minX, "⇧ movement stops at the screen edge (x = \(probe.cursor.x))")
+        }
         check(snap.crop(CGRect(x: 100, y: 80, width: 520, height: 320))?.width == 1040, "region crop maps points → pixels")
         check(probe.snapshot.window(at: CGPoint(x: 300, y: 200))?.windowID == 1, "window hit-test under cursor")
 

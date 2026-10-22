@@ -38,7 +38,7 @@ Screen & System Audio Recording). Turn it on, then quit and reopen the app.
 | Capture Full Screen | ⌃⇧3 | All displays as one picture. The menu also has "Capture Screen" for a single display. |
 | Capture Last Region | ⌃⇧6 | Same area as last time. |
 
-While selecting: **Space** switches between region and window mode, **arrow keys** move the pointer by 1 pt
+While selecting: hold **Shift** to move the pointer at quarter speed, **Space** switches between region and window mode, **arrow keys** move the pointer by 1 pt
 (⇧ for 10), **Return** accepts, **Esc** or right-click cancels.
 
 The screen is frozen the moment you press the hotkey (like Greenshot), so open menus and tooltips can be
