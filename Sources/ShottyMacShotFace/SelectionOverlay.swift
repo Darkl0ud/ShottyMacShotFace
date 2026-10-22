@@ -51,9 +51,6 @@ final class SelectionOverlay {
             windows.append(w)
         }
         NSApp.activate(ignoringOtherApps: true)
-        // After a warp macOS ignores real mouse movement for 0.25 s by default, which would make
-        // Shift-precision movement stutter. Turn that pause off while the overlay is up.
-        CGEventSource(stateID: .combinedSessionState)?.localEventsSuppressionInterval = 0
         cursor = mouseLocation()
         let start = windows.first { $0.frame.contains(NSEvent.mouseLocation) } ?? windows.first
         start?.makeKey()
@@ -74,17 +71,38 @@ final class SelectionOverlay {
 
     /// Pointer speed while Shift is held.
     static let precisionFactor: CGFloat = 0.25
-    /// Moves the real on-screen pointer. Swappable so the self-test doesn't move Warren's mouse.
-    var warp: (CGPoint) -> Void = { p in
-        CGWarpMouseCursorPosition(p)
-        CGAssociateMouseAndMouseCursorPosition(1)
+
+    /// The real pointer, behind closures so the self-test never touches Warren's mouse.
+    struct Pointer {
+        var warp: (CGPoint) -> Void = { CGWarpMouseCursorPosition($0) }
+        /// false = the on-screen pointer stops following the mouse; movement still arrives as deltas.
+        var follow: (Bool) -> Void = { CGAssociateMouseAndMouseCursorPosition($0 ? 1 : 0) }
+        var setHidden: (Bool) -> Void = { $0 ? NSCursor.hide() : NSCursor.unhide() }
+    }
+    var pointer = Pointer()
+    private(set) var isPrecise = false
+
+    /// Shift down: freeze and hide the real pointer and drive our own crosshair from raw movement,
+    /// at a quarter of the speed. Moving the real pointer on every event instead (the first version)
+    /// fought macOS's own pointer handling and made it snap back.
+    func setPrecise(_ on: Bool) {
+        guard on != isPrecise else { return }
+        isPrecise = on
+        if on {
+            cursor = mouseLocation()
+            pointer.follow(false)
+            pointer.setHidden(true)
+        } else {
+            // One hand-off: put the real pointer where our crosshair is, then let it follow again.
+            pointer.warp(cursor)
+            pointer.follow(true)
+            pointer.setHidden(false)
+        }
+        refresh()
     }
 
-    /// Normally the selection follows the real pointer. With Shift held, we move our own cursor by a
-    /// fraction of the hand's movement (the event's raw delta) and put the real pointer there, so what
-    /// you see is always what gets selected. Letting go of Shift simply resumes following the pointer.
     func track(_ e: NSEvent?) {
-        guard let e, e.modifierFlags.contains(.shift) else {
+        guard isPrecise, let e else {
             cursor = mouseLocation()
             return
         }
@@ -93,8 +111,9 @@ final class SelectionOverlay {
         p.x = min(max(p.x, snapshot.frame.minX), snapshot.frame.maxX - 1)
         p.y = min(max(p.y, snapshot.frame.minY), snapshot.frame.maxY - 1)
         cursor = p
-        warp(p)
     }
+
+    func flagsChanged(_ e: NSEvent) { setPrecise(e.modifierFlags.contains(.shift)) }
 
     // MARK: Events (forwarded from the views)
 
@@ -105,8 +124,8 @@ final class SelectionOverlay {
     }
 
     func mouseDown(_ e: NSEvent? = nil) {
-        // A click doesn't move the pointer: keep the precise position if Shift is down.
-        if !(e?.modifierFlags.contains(.shift) ?? false) { cursor = mouseLocation() }
+        // While precise, the real pointer is frozen elsewhere; our crosshair is the truth.
+        if !isPrecise { cursor = mouseLocation() }
         if mode == .region { dragStart = cursor }
         refresh()
     }
@@ -117,7 +136,7 @@ final class SelectionOverlay {
     }
 
     func mouseUp(_ e: NSEvent? = nil) {
-        if !(e?.modifierFlags.contains(.shift) ?? false) { cursor = mouseLocation() }
+        if !isPrecise { cursor = mouseLocation() }
         switch mode {
         case .region:
             if let r = selectionRect, r.width >= 3, r.height >= 3 {
@@ -155,7 +174,7 @@ final class SelectionOverlay {
             case 125: p.y += step
             default: p.y -= step
             }
-            warp(p)
+            if !isPrecise { pointer.warp(p); pointer.follow(true) }
             cursor = p
             if dragStart == nil { updateHover() }
             refresh()
@@ -165,6 +184,7 @@ final class SelectionOverlay {
     }
 
     func finish(_ outcome: Outcome) {
+        setPrecise(false)
         for w in windows { w.orderOut(nil); w.close() }
         windows.removeAll()
         NSCursor.arrow.set()
@@ -232,6 +252,7 @@ final class SelectionDrawView: NSView {
     override func mouseUp(with event: NSEvent) { overlay?.mouseUp(event) }
     override func rightMouseDown(with event: NSEvent) { overlay?.finish(.cancelled) }
     override func keyDown(with event: NSEvent) { overlay?.keyDown(event) }
+    override func flagsChanged(with event: NSEvent) { overlay?.flagsChanged(event) }
 
     private func local(_ r: CGRect) -> CGRect { r.offsetBy(dx: -globalRect.minX, dy: -globalRect.minY) }
     private func local(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x - globalRect.minX, y: p.y - globalRect.minY) }
@@ -273,6 +294,7 @@ final class SelectionDrawView: NSView {
         }
 
         if cursorHere, o.dragStart == nil, o.mode == .region { drawCrosshair(at: cur, ctx: ctx) }
+        if cursorHere, o.isPrecise { drawPointer(at: cur, ctx: ctx) }
         if cursorHere, o.showMagnifier { drawMagnifier(around: o.cursor, local: cur, ctx: ctx) }
         if cursorHere { drawHint(o.mode, ctx: ctx) }
     }
@@ -289,6 +311,18 @@ final class SelectionDrawView: NSView {
             ctx.strokePath()
         }
         ctx.restoreGState()
+    }
+
+    /// Stand-in for the hidden system pointer in Shift-precision mode: a small crosshair.
+    private func drawPointer(at p: CGPoint, ctx: CGContext) {
+        let x = p.x.rounded() + 0.5, y = p.y.rounded() + 0.5, r: CGFloat = 9
+        for (color, w) in [(NSColor.white, CGFloat(3)), (NSColor.black, CGFloat(1))] {
+            ctx.setStrokeColor(color.cgColor)
+            ctx.setLineWidth(w)
+            ctx.move(to: CGPoint(x: x - r, y: y)); ctx.addLine(to: CGPoint(x: x + r, y: y))
+            ctx.move(to: CGPoint(x: x, y: y - r)); ctx.addLine(to: CGPoint(x: x, y: y + r))
+            ctx.strokePath()
+        }
     }
 
     /// Zoomed, unsmoothed view of the pixels around the pointer, for pixel-exact edges.
