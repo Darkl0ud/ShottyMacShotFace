@@ -429,8 +429,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
             if shift, case .point(let idx) = h, let e = doc.element(id), e.points.count == 2 {
                 target = Geometry.snap45(from: e.points[1 - idx], to: p)
             }
+            let s = doc.pixelScale
             doc.mutateLive { st in
-                if let i = st.elements.firstIndex(where: { $0.id == id }) { st.elements[i].drag(h, to: target) }
+                guard let i = st.elements.firstIndex(where: { $0.id == id }) else { return }
+                st.elements[i].drag(h, to: target)
+                // Narrowing a text box wraps its text onto more lines: grow it so none is hidden.
+                if st.elements[i].kind.hasText { st.elements[i] = Renderer.fittingText(st.elements[i], pixelScale: s) }
             }
         case .rubberBand(let start, _):
             drag = .rubberBand(start: start, current: p)
@@ -491,7 +495,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
         case .line, .arrow: tooSmall = e.points[0].distance(to: e.points[1]) < 3
         case .freehand: tooSmall = false
         case .text, .speechBubble:
-            if e.frame.width < 12 || e.frame.height < 12 {
+            // A click, or a drag too small to type in (thresholds in points), gets a sensibly sized box.
+            if e.frame.width < (e.kind == .text ? 40 : 60) * s || e.frame.height < 12 * s {
                 // A plain click gets a sensibly sized box.
                 doc.mutateLive { st in
                     guard let i = st.elements.firstIndex(where: { $0.id == id }) else { return }
@@ -637,10 +642,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
         needsDisplay = true
     }
 
-    /// Applies a style tweak to the selected elements (all of them, or only those of `kind`)
+    /// Applies a style tweak to the selected elements (only those whose kind matches)
     /// as one undo step. Text boxes grow to fit a bigger font; counters take their size from it.
-    func applyStyleToSelection(only kind: ElementKind? = nil, _ change: (inout ElementStyle) -> Void) {
-        let ids = selection.filter { id in kind.map { doc.element(id)?.kind == $0 } ?? true }
+    func applyStyleToSelection(matching kinds: (ElementKind) -> Bool = { _ in true }, _ change: (inout ElementStyle) -> Void) {
+        let ids = selection.filter { id in doc.element(id).map { kinds($0.kind) } ?? false }
         guard !ids.isEmpty else { return }
         let s = doc.pixelScale
         let body: (inout DocState) -> Void = { st in
@@ -652,7 +657,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     let d = e.style.fontSize * 2 * s
                     e.frame = CGRect(x: e.frame.midX - d / 2, y: e.frame.midY - d / 2, width: d, height: d)
                 }
-                if e.kind.hasText { e.frame = Renderer.frameFittingText(e, pixelScale: s) }
+                if e.kind.hasText { e = Renderer.fittingText(e, pixelScale: s) }
                 st.elements[i] = e
             }
         }
@@ -729,16 +734,18 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 var typed = e
                 typed.text = text
                 // Grow the box to fit every line, in the same step as the text itself.
-                let frame = Renderer.frameFittingText(typed, pixelScale: doc.pixelScale)
+                let fitted = Renderer.fittingText(typed, pixelScale: doc.pixelScale)
+                let frame = fitted.frame
                 if isNew {
                     doc.mutateLive { st in
                         guard let i = st.elements.firstIndex(where: { $0.id == id }) else { return }
                         st.elements[i].text = text
                         st.elements[i].frame = frame
+                        st.elements[i].points = fitted.points
                     }
                     doc.endLiveChange()
                 } else if text != e.text || frame != e.frame {
-                    doc.update(id) { $0.text = text; $0.frame = frame }
+                    doc.update(id) { $0.text = text; $0.frame = frame; $0.points = fitted.points }
                 }
             }
         } else if isNew {

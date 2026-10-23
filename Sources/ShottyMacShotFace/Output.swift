@@ -8,8 +8,7 @@ import UserNotifications
 enum Output {
     static var lastSavedURL: URL?
 
-    static func copyToClipboard(_ image: CGImage, pixelScale: CGFloat) {
-        let pb = NSPasteboard.general
+    static func copyToClipboard(_ image: CGImage, pixelScale: CGFloat, to pb: NSPasteboard = .general) {
         pb.clearContents()
         let item = NSPasteboardItem()
         if let png = try? ImageExporter.data(for: image, format: .png) { item.setData(png, forType: .png) }
@@ -27,10 +26,19 @@ enum Output {
         pb.canReadObject(forClasses: [NSImage.self], options: nil)
     }
 
-    static func imageFromClipboard() -> CGImage? {
-        guard let ns = NSImage(pasteboard: NSPasteboard.general) else { return nil }
+    static func imageFromClipboard() -> CGImage? { imageFromClipboardWithScale()?.image }
+
+    /// The clipboard image and its pixels-per-point. Our own copies carry a TIFF sized in points (and
+    /// so do most Mac apps'), which tells a Retina image apart; the PNG alone always reads as 1x.
+    static func imageFromClipboardWithScale(_ pb: NSPasteboard = .general) -> (image: CGImage, scale: CGFloat)? {
+        guard let ns = NSImage(pasteboard: pb) else { return nil }
         var r = CGRect(origin: .zero, size: ns.size)
-        return ns.cgImage(forProposedRect: &r, context: nil, hints: nil)
+        guard let img = ns.cgImage(forProposedRect: &r, context: nil, hints: nil) else { return nil }
+        var scale: CGFloat = 1
+        if let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff), rep.size.width > 0 {
+            scale = min(3, max(1, (CGFloat(rep.pixelsWide) / rep.size.width).rounded()))
+        }
+        return (img, scale)
     }
 
     static func patternURL(title: String, date: Date, format: ImageFormat) -> URL {

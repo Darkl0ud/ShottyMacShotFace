@@ -20,6 +20,8 @@ final class SelectionOverlay {
     var hovered: WindowInfo?
     /// Esc dropped the drag while the button was still down: the coming mouseUp must not capture.
     private(set) var pressAborted = false
+    /// Mouse button currently held over the overlay.
+    private(set) var isPressed = false
 
     private var windows: [NSWindow] = []
     /// One per screen. The self-test adds its own offscreen views here.
@@ -186,8 +188,15 @@ final class SelectionOverlay {
         return false
     }
 
+    /// The hotkey's own modifier release can reach the previous app before we're active. Any mouse
+    /// motion with none of them held proves they're up, so Shift precision is allowed from then on.
+    private func rearmPrecisionIfReleased() {
+        if !precisionArmed, pointer.modifiers().intersection(Self.chordModifiers).isEmpty { precisionArmed = true }
+    }
+
     func mouseMoved(_ e: NSEvent? = nil) {
         if let e, isRepeat(e) { return }
+        rearmPrecisionIfReleased()
         track(e)
         if dragStart == nil { updateHover() }
         refresh()
@@ -195,6 +204,7 @@ final class SelectionOverlay {
 
     func mouseDown(_ e: NSEvent? = nil) {
         pressAborted = false
+        isPressed = true
         // While precise, the real pointer is frozen elsewhere; our crosshair is the truth.
         if !isPrecise { cursor = mouseLocation() }
         if mode == .region { dragStart = cursor }
@@ -203,12 +213,14 @@ final class SelectionOverlay {
 
     func mouseDragged(_ e: NSEvent? = nil) {
         if let e, isRepeat(e) { return }
+        rearmPrecisionIfReleased()
         track(e)
         if pressAborted { updateHover() }
         refresh()
     }
 
     func mouseUp(_ e: NSEvent? = nil) {
+        isPressed = false
         if !isPrecise { cursor = mouseLocation() }
         if pressAborted {
             // Esc already dropped this press; releasing the button just lets the user start again.
@@ -245,6 +257,8 @@ final class SelectionOverlay {
             }
         case 49: // Space
             mode = mode == .region ? .window : .region
+            // Switching mode mid-press abandons that press (like Esc), so releasing doesn't capture.
+            if dragStart != nil || isPressed { pressAborted = true }
             dragStart = nil
             updateHover()
             refresh()
@@ -332,6 +346,14 @@ final class SelectionDimView: NSView {
         border.lineWidth = 1
         layer?.addSublayer(dim)
         layer?.addSublayer(border)
+    }
+
+    // Hand-added sublayers stay at contentsScale 1 and render blurry on Retina unless told.
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        dim.contentsScale = scale
+        border.contentsScale = scale
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -426,7 +448,8 @@ final class SelectionDrawView: NSView {
     func currentState() -> DrawnState? {
         guard let o = overlay else { return nil }
         let here = globalRect.contains(o.cursor)
-        let hover = o.hovered.flatMap { globalRect.intersects($0.frame) ? $0 : nil }
+        // No hover box anywhere while a selection is being dragged (draw() paints none then either).
+        let hover = o.dragStart != nil ? nil : o.hovered.flatMap { globalRect.intersects($0.frame) ? $0 : nil }
         return DrawnState(cursor: here ? o.cursor : nil, selection: here ? o.selectionRect : nil,
                           hovered: hover?.windowID, hoveredFrame: hover?.frame, mode: o.mode,
                           precise: here && o.isPrecise, dragging: here && o.dragStart != nil)

@@ -68,7 +68,7 @@ Open in the image editor · copy to clipboard · save with the filename pattern 
 | Obfuscate | O | Pixelate (default, 4 pt blocks) or blur with soft edges, adjustable strength |
 | Crop | C | Drag, then Return (Esc cancels) |
 
-Also: undo/redo (100 steps), cut/copy/paste/duplicate of annotations, pasting an image from the clipboard
+Also: undo/redo (up to 100 steps; fewer after many whole-picture effects on very large captures), cut/copy/paste/duplicate of annotations, pasting an image from the clipboard
 or inserting one from a file, z-order (⌘[ ⌘] and Page Up/Down), arrow-key nudging, zoom (⌘+ ⌘- ⌘0 ⌘9).
 Tool settings are remembered between captures. Text boxes grow to fit what you type. Opened and inserted photos are
 shown upright.

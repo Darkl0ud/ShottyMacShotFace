@@ -57,7 +57,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let pending: [QuitReviewable] = editors.filter(\.hasUnsavedWork)
         guard !pending.isEmpty else { return .terminateNow }
-        Self.reviewForQuit(pending) { ok in NSApp.reply(toApplicationShouldTerminate: ok) }
+        isReviewingQuit = true // a capture started now would open an editor nobody asks about
+        Self.reviewForQuit(pending) { [weak self] ok in
+            self?.isReviewingQuit = false
+            NSApp.reply(toApplicationShouldTerminate: ok)
+        }
         return .terminateLater
     }
 
@@ -241,7 +245,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     /// Not while another capture runs, nor during an app-modal panel or alert: AppKit gives a
     /// non-modal window (the overlay) no mouse input then, so it couldn't be used or dismissed.
-    var canStartCapture: Bool { !busy && overlay == nil && NSApp.modalWindow == nil }
+    private(set) var isReviewingQuit = false
+    private var pendingDestinationMenu: NSMenu?
+    var canStartCapture: Bool { !busy && overlay == nil && NSApp.modalWindow == nil && !isReviewingQuit }
 
     func capture(_ action: HotkeyAction) {
         guard canStartCapture else {
@@ -404,7 +410,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private func showDestinationMenu(_ r: CaptureResult) {
         let menu = makeDestinationMenu(r)
         NSApp.activate(ignoringOtherApps: true)
-        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+        // popUp runs a nested event loop; started from inside the capture Task it would hold the
+        // main actor (and busy) for as long as the menu is open. Run it on its own run-loop turn.
+        let at = NSEvent.mouseLocation
+        pendingDestinationMenu = menu
+        RunLoop.main.perform(inModes: [.common]) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, let menu = self.pendingDestinationMenu else { return }
+                self.pendingDestinationMenu = nil
+                menu.popUp(positioning: nil, at: at, in: nil)
+            }
+        }
     }
 
     @objc func destinationChosen(_ sender: NSMenuItem) {
@@ -459,9 +475,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 
     @objc func openImageFromClipboard() {
-        guard let img = Output.imageFromClipboard() else { NSSound.beep(); return }
+        guard let (img, scale) = Output.imageFromClipboardWithScale() else { NSSound.beep(); return }
         // It came from the clipboard, so it already exists there, like a capture copied there.
-        openEditor(image: img, scale: 1, title: "Clipboard", date: Date(), wasExported: true)
+        openEditor(image: img, scale: scale, title: "Clipboard", date: Date(), wasExported: true)
     }
 
     // MARK: Preferences

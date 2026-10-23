@@ -212,7 +212,9 @@ public final class Renderer {
 
     /// Where the words go inside a text box or speech bubble (document pixels).
     public static func textRect(for e: Element, pixelScale s: CGFloat) -> CGRect {
-        e.kind == .speechBubble ? e.frame.insetBy(dx: 8 * s, dy: 6 * s) : e.frame.insetBy(dx: 4 * s, dy: 2 * s)
+        let (dx, dy) = e.kind == .speechBubble ? (8 * s, 6 * s) : (4 * s, 2 * s)
+        // Clamp the inset: on a very small box a full inset gives CGRect.null (origin at infinity).
+        return e.frame.insetBy(dx: min(dx, max(0, e.frame.width / 2 - 1)), dy: min(dy, max(0, e.frame.height / 2 - 1)))
     }
 
     static func attributedText(_ text: String, style st: ElementStyle, pixelScale: CGFloat, center: Bool) -> NSAttributedString {
@@ -238,6 +240,18 @@ public final class Renderer {
 
     /// The element's frame, grown downwards (never shrunk) so all of its text fits. drawText clips
     /// to the box, so without this a second line or a wrapped sentence was silently cut off.
+    /// The element with its frame grown to fit its text. A speech bubble's tail tip moves down with
+    /// the body, so a taller bubble doesn't swallow its own tail (bubblePath drops a tip inside the body).
+    public static func fittingText(_ e: Element, pixelScale s: CGFloat) -> Element {
+        var out = e
+        out.frame = frameFittingText(e, pixelScale: s)
+        let grow = out.frame.height - e.frame.height
+        if e.kind == .speechBubble, grow > 0, let tip = e.points.first, tip.y >= e.frame.maxY {
+            out.points[0] = CGPoint(x: tip.x, y: tip.y + grow)
+        }
+        return out
+    }
+
     public static func frameFittingText(_ e: Element, pixelScale s: CGFloat) -> CGRect {
         guard e.kind.hasText, !e.text.isEmpty else { return e.frame }
         let inner = textRect(for: e, pixelScale: s)

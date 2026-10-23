@@ -610,20 +610,24 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     /// Greenshot. It used to restyle any selected shape of another kind too, and rewrite that
     /// kind's remembered style. With Select, it changes the selected elements and remembers the
     /// new style for their kinds.
-    private func changeStyle(_ change: (inout ElementStyle) -> Void) {
+    /// `kinds` limits which element kinds a control affects: font controls only text, the counter
+    /// Size only counters (both live in fontSize, so a mixed selection would otherwise cross over).
+    private func changeStyle(kinds: @escaping (ElementKind) -> Bool = { _ in true },
+                             _ change: (inout ElementStyle) -> Void) {
         guard !isUpdatingControls else { return }
         if let k = canvas.tool.kind {
+            guard kinds(k) else { return }
             var s = style(for: k)
             change(&s)
             rememberStyle(s, for: k)
-            canvas.applyStyleToSelection(only: k, change)
+            canvas.applyStyleToSelection(matching: { $0 == k }, change)
         } else {
-            for k in Set(canvas.selectedElements.map(\.kind)) {
+            for k in Set(canvas.selectedElements.map(\.kind)) where kinds(k) {
                 var s = style(for: k)
                 change(&s)
                 rememberStyle(s, for: k)
             }
-            canvas.applyStyleToSelection(change)
+            canvas.applyStyleToSelection(matching: kinds, change)
         }
         updatePropertyBar()
     }
@@ -645,13 +649,13 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     }
     @objc func fontChanged(_ sender: NSPopUpButton) {
         guard let name = sender.titleOfSelectedItem else { return }
-        changeStyle { $0.fontName = name }
+        changeStyle(kinds: \.hasText) { $0.fontName = name }
     }
     @objc func fontSizeChanged(_ sender: NSPopUpButton) {
-        let v = Self.fontSizes[sender.indexOfSelectedItem]; changeStyle { $0.fontSize = v }
+        let v = Self.fontSizes[sender.indexOfSelectedItem]; changeStyle(kinds: \.hasText) { $0.fontSize = v }
     }
-    @objc func boldChanged(_ sender: NSButton) { let on = sender.state == .on; changeStyle { $0.bold = on } }
-    @objc func italicChanged(_ sender: NSButton) { let on = sender.state == .on; changeStyle { $0.italic = on } }
+    @objc func boldChanged(_ sender: NSButton) { let on = sender.state == .on; changeStyle(kinds: \.hasText) { $0.bold = on } }
+    @objc func italicChanged(_ sender: NSButton) { let on = sender.state == .on; changeStyle(kinds: \.hasText) { $0.italic = on } }
     @objc func highlightModeChanged(_ sender: NSPopUpButton) {
         let m = HighlightMode.allCases[sender.indexOfSelectedItem]; changeStyle { $0.highlightMode = m }
     }
@@ -666,7 +670,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         let v = Self.magnifications[sender.indexOfSelectedItem]; changeStyle { $0.magnification = v }
     }
     @objc func counterSizeChanged(_ sender: NSPopUpButton) {
-        let d = Self.counterSizes[sender.indexOfSelectedItem]; changeStyle { $0.fontSize = d / 2 }
+        let d = Self.counterSizes[sender.indexOfSelectedItem]; changeStyle(kinds: { $0 == .counter }) { $0.fontSize = d / 2 }
     }
 
     @objc func toolClicked(_ sender: NSButton) {
@@ -952,6 +956,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         canvas.endTextEdit()
         guard hasUnsavedWork else { done(true); return }
         if savePromptResponder == nil { // the self-checks never put a window on screen
+            // Quit from the status menu, the Dock or a logout arrives while the app is inactive; without
+            // activating, the window and its sheet open behind other apps and Quit looks dead.
+            NSApp.activate(ignoringOtherApps: true)
             showWindow(nil)
             window?.makeKeyAndOrderFront(nil)
         }
