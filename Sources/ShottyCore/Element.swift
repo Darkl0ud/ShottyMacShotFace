@@ -76,6 +76,61 @@ public struct ElementStyle: Codable, Hashable, Sendable {
         }
         return s
     }
+
+    // Hand-written decoding, like AppSettings: a key missing from an older (or newer) settings
+    // file, or an enum value this version doesn't know, falls back to the default for that one
+    // field instead of throwing away the whole style.
+    enum CodingKeys: String, CodingKey {
+        case stroke, fill, lineWidth, shadow, arrowHeads, fontName, fontSize, bold, italic, highlightMode,
+             obfuscateMode, pixelSize, blurRadius, magnification
+    }
+
+    public init(from decoder: Decoder) throws {
+        self = try ElementStyle.decode(from: decoder.container(keyedBy: CodingKeys.self), base: ElementStyle())
+    }
+
+    /// Fills in whatever keys are present on top of `base` (the tool's own defaults when known).
+    static func decode(from c: KeyedDecodingContainer<CodingKeys>, base: ElementStyle) -> ElementStyle {
+        var s = base
+        func get<T: Decodable>(_ k: CodingKeys, _ t: T.Type) -> T? { (try? c.decodeIfPresent(t, forKey: k)) ?? nil }
+        s.stroke = get(.stroke, RGBA.self) ?? s.stroke
+        s.fill = get(.fill, RGBA.self) ?? s.fill
+        s.lineWidth = get(.lineWidth, CGFloat.self) ?? s.lineWidth
+        s.shadow = get(.shadow, Bool.self) ?? s.shadow
+        s.arrowHeads = get(.arrowHeads, ArrowHeads.self) ?? s.arrowHeads
+        s.fontName = get(.fontName, String.self) ?? s.fontName
+        s.fontSize = get(.fontSize, CGFloat.self) ?? s.fontSize
+        s.bold = get(.bold, Bool.self) ?? s.bold
+        s.italic = get(.italic, Bool.self) ?? s.italic
+        s.highlightMode = get(.highlightMode, HighlightMode.self) ?? s.highlightMode
+        s.obfuscateMode = get(.obfuscateMode, ObfuscateMode.self) ?? s.obfuscateMode
+        s.pixelSize = get(.pixelSize, CGFloat.self) ?? s.pixelSize
+        s.blurRadius = get(.blurRadius, CGFloat.self) ?? s.blurRadius
+        s.magnification = get(.magnification, CGFloat.self) ?? s.magnification
+        return s
+    }
+}
+
+/// Decodes a `[String: ElementStyle]` one entry at a time, so one unreadable entry only drops
+/// itself, and missing keys fall back to that tool's own defaults (not the generic ones).
+struct ToolStyles: Decodable {
+    var styles: [String: ElementStyle] = [:]
+
+    struct Key: CodingKey {
+        var stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Key.self)
+        for k in c.allKeys {
+            guard let entry = try? c.nestedContainer(keyedBy: ElementStyle.CodingKeys.self, forKey: k) else { continue }
+            let base = ElementKind(rawValue: k.stringValue).map(ElementStyle.defaults(for:)) ?? ElementStyle()
+            styles[k.stringValue] = ElementStyle.decode(from: entry, base: base)
+        }
+    }
 }
 
 /// One annotation. A plain value type: the whole document state is just an image plus an array of

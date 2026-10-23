@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -476,5 +477,279 @@ func isBlack(_ p: PixelReader.Pixel) -> Bool { p.r < 20 && p.g < 20 && p.b < 20 
     @Test func defaultHotkeysAreDistinct() {
         let all = HotkeyAction.allCases.map(\.defaultHotkey)
         #expect(Set(all).count == all.count)
+    }
+}
+
+// MARK: Review round 1 (CORE_EDITOR findings)
+
+/// Decodes encoded data back to the first image, without any orientation handling.
+func decodeFirst(_ data: Data) throws -> PixelReader {
+    guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { throw MissingImage() }
+    return try pixels(CGImageSourceCreateImageAtIndex(src, 0, nil))
+}
+
+func tempURL(_ name: String) -> URL {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("shotty-tests-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent(name)
+}
+
+@Suite struct TextFitTests {
+    /// CORE_EDITOR-1: a click-made box is one line tall (240 × fontSize·2.4 pt); drawText clips
+    /// to it, so line two used to vanish from the saved picture.
+    @Test func secondLineIsRenderedAfterFitting() throws {
+        let r = Renderer(pixelScale: 1)
+        var e = Element(kind: .text, frame: CGRect(x: 10, y: 10, width: 240, height: 18 * 2.4))
+        e.style.stroke = .black
+        e.text = "first line\nsecond line"
+        var fitted = e
+        fitted.frame = Renderer.frameFittingText(e, pixelScale: 1)
+        #expect(fitted.frame.height > e.frame.height)
+        // Ink in the band where line two goes: below the first line's height.
+        let oneLine = Renderer.textHeight("first line", style: e.style, pixelScale: 1, width: 232)
+        func inkInSecondLine(_ el: Element) throws -> Int {
+            var s = DocState(image: solid(300, 200))
+            s.elements = [el]
+            let px = try pixels(r.flatten(s))
+            var n = 0
+            for y in (12 + Int(oneLine))..<Int(fitted.frame.maxY) { for x in 10..<250 where px[x, y].r < 128 { n += 1 } }
+            return n
+        }
+        #expect(try inkInSecondLine(e) == 0)       // the bug: the one-line box drops line two entirely
+        #expect(try inkInSecondLine(fitted) > 20)  // fitted: line two is in the picture
+    }
+
+    @Test func wrappedSentenceFitsAndBoxNeverShrinks() {
+        var e = Element(kind: .text, frame: CGRect(x: 0, y: 0, width: 240, height: 43.2))
+        e.text = "a sentence that is clearly longer than two hundred and forty points at eighteen points"
+        let f = Renderer.frameFittingText(e, pixelScale: 1)
+        let need = Renderer.textHeight(e.text, style: e.style, pixelScale: 1, width: 240 - 8)
+        #expect(f.height - 4 >= need && f.width == 240 && f.origin == e.frame.origin)
+        var big = e
+        big.frame.size.height = 500
+        #expect(Renderer.frameFittingText(big, pixelScale: 1).height == 500)
+    }
+
+    @Test func bubbleFitUsesItsLargerInset() {
+        var e = Element(kind: .speechBubble, frame: CGRect(x: 0, y: 0, width: 200, height: 40), points: [CGPoint(x: 10, y: 120)])
+        e.text = "one\ntwo\nthree"
+        let f = Renderer.frameFittingText(e, pixelScale: 2)
+        let need = Renderer.textHeight(e.text, style: e.style, pixelScale: 2, width: 200 - 32, center: true)
+        #expect(f.height - 24 >= need)
+    }
+}
+
+@Suite struct ExportedStateTests {
+    /// CORE_EDITOR-3: a brand-new capture with no file and no clipboard copy must count as unsaved.
+    @Test func newCaptureHasUnexportedChanges() {
+        let d = EditorDocument(image: solid(10, 10))
+        #expect(!d.isDirty)            // nothing edited…
+        #expect(d.hasUnexportedChanges) // …but it exists nowhere else
+        #expect(!d.wasExported)
+    }
+
+    @Test func exportCoversCurrentStateOnly() {
+        let d = EditorDocument(image: solid(10, 10))
+        d.wasExported = true
+        #expect(!d.hasUnexportedChanges)
+        d.add(Element(kind: .rectangle))
+        #expect(d.hasUnexportedChanges && d.wasExported)
+        d.markSaved()
+        #expect(!d.hasUnexportedChanges && !d.isDirty)
+        d.undo()
+        #expect(d.hasUnexportedChanges)
+    }
+}
+
+@Suite struct LiveChangeSafetyTests {
+    /// CORE_EDITOR-7: undo in the middle of a create-drag used to make the previous state unreachable.
+    @Test func undoMidDragKeepsHistoryReachable() {
+        let d = EditorDocument(image: solid(100, 100))
+        d.add(Element(kind: .rectangle, frame: CGRect(x: 0, y: 0, width: 10, height: 10)))
+        d.beginLiveChange()
+        d.mutateLive { $0.elements.append(Element(kind: .line, points: [.zero, CGPoint(x: 5, y: 5)])) }
+        d.undo()
+        d.cancelLiveChange() // what mouseUp does for a shape that vanished
+        while d.canUndo { d.undo() }
+        #expect(d.state.elements.isEmpty, "the empty starting state must still be reachable")
+    }
+
+    @Test func deleteMidMoveDoesNotInventSteps() {
+        let d = EditorDocument(image: solid(100, 100))
+        let id = d.add(Element(kind: .rectangle, frame: CGRect(x: 1, y: 0, width: 10, height: 10)))
+        d.beginLiveChange()
+        d.mutateLive { $0.elements[0].frame.origin.x = 30 }
+        d.remove([id])
+        #expect(!d.isInLiveChange)
+        d.undo()
+        #expect(d.element(id)?.frame.origin.x == 30) // the move was committed as its own step
+        d.undo()
+        #expect(d.element(id)?.frame.origin.x == 1)
+        d.undo()
+        #expect(d.state.elements.isEmpty && !d.canUndo)
+    }
+
+    @Test func danglingLiveChangeIsCommittedNotLost() {
+        let d = EditorDocument(image: solid(100, 100))
+        d.beginLiveChange()
+        d.mutateLive { $0.elements.append(Element(kind: .rectangle)) }
+        d.beginLiveChange() // the mouse-up never came
+        d.mutateLive { $0.elements[0].frame.size.width = 50 }
+        d.endLiveChange()
+        d.undo(); d.undo()
+        #expect(d.state.elements.isEmpty)
+    }
+
+    @Test func mutateLiveWithoutBeginIsStillUndoable() {
+        let d = EditorDocument(image: solid(100, 100))
+        d.mutateLive { $0.elements.append(Element(kind: .rectangle)) }
+        d.endLiveChange()
+        #expect(d.canUndo)
+    }
+}
+
+@Suite struct UndoMemoryTests {
+    /// CORE_EDITOR-13: every effect step keeps a full bitmap; the history is capped by bytes too.
+    @Test func imageStepsAreCappedByMemory() {
+        let d = EditorDocument(image: solid(500, 500)) // ~1 MB per picture
+        d.undoMemoryLimit = 5 * 1_000_000
+        for i in 0..<20 { d.replaceImage(solid(500, 500, RGBA(Double(i) / 20, 0, 0))) }
+        #expect(d.undoImageBytes <= d.undoMemoryLimit)
+        #expect(d.undoStack.count >= 3 && d.undoStack.count < 20)
+    }
+
+    @Test func annotationStepsCostNothingExtra() {
+        let d = EditorDocument(image: solid(500, 500))
+        d.undoMemoryLimit = 1
+        for i in 0..<150 { d.add(Element(kind: .rectangle, frame: CGRect(x: i, y: 0, width: 5, height: 5))) }
+        #expect(d.undoStack.count == 100) // only the count limit applies: they share one picture
+    }
+}
+
+@Suite struct ExportFixTests {
+    func pixel(alpha: Double) -> CGImage { Bitmap.solid(width: 8, height: 8, color: RGBA(0, 0, 0, alpha))! }
+
+    /// CORE_EDITOR-6: GIF has 1-bit transparency; partly transparent pixels came out opaque black.
+    @Test func gifNeverTurnsSoftShadowBlack() throws {
+        let faint = try decodeFirst(ImageExporter.data(for: pixel(alpha: 0.3), format: .gif))[4, 4]
+        #expect(faint.a == 0, "30% shadow → transparent, got \(faint)")
+        let strong = try decodeFirst(ImageExporter.data(for: pixel(alpha: 0.7), format: .gif))[4, 4]
+        #expect(strong.a == 255 && strong.r > 50 && strong.r < 110, "70% black over white → grey, got \(strong)")
+        let clear = try decodeFirst(ImageExporter.data(for: pixel(alpha: 0), format: .gif))[4, 4]
+        #expect(clear.a == 0)
+        let opaque = try decodeFirst(ImageExporter.data(for: topRed(20, 20), format: .gif))
+        #expect(isRed(opaque[10, 2]) && isWhite(opaque[10, 15]))
+    }
+
+    @Test func pngAndHeicKeepPartialAlpha() throws {
+        let png = try decodeFirst(ImageExporter.data(for: pixel(alpha: 0.3), format: .png))[4, 4]
+        #expect(png.a > 60 && png.a < 95)
+        #expect(!ImageFormat.gif.supportsAlpha && ImageFormat.heic.supportsAlpha)
+    }
+
+    /// CORE_EDITOR-14: a JPEG stored 40×20 with EXIF orientation 6 displays 20×40.
+    @Test func loadAppliesExifOrientation() throws {
+        let url = tempURL("rotated.jpg")
+        let dest = try #require(CGImageDestinationCreateWithURL(url as CFURL, "public.jpeg" as CFString, 1, nil))
+        CGImageDestinationAddImage(dest, topRed(40, 20), [kCGImagePropertyOrientation: 6] as CFDictionary)
+        #expect(CGImageDestinationFinalize(dest))
+        let img = try #require(ImageExporter.load(from: url))
+        #expect(img.width == 20 && img.height == 40)
+        // Orientation 6 = rotate 90° clockwise to display: the stored top band ends up on the right.
+        let px = try pixels(img)
+        #expect(isRed(px[17, 20]) && !isRed(px[2, 20]))
+        let ed = try #require(ImageExporter.loadForEditor(from: url))
+        #expect(ed.image.width == 20 && ed.pixelScale == 1)
+    }
+
+    @Test func loadForEditorReadsRetinaDPI() throws {
+        let url = tempURL("retina.png")
+        let dest = try #require(CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil))
+        CGImageDestinationAddImage(dest, topRed(30, 30), [kCGImagePropertyDPIWidth: 144, kCGImagePropertyDPIHeight: 144] as CFDictionary)
+        #expect(CGImageDestinationFinalize(dest))
+        let r = try #require(ImageExporter.loadForEditor(from: url))
+        #expect(r.pixelScale == 2 && r.image.width == 30)
+        let plain = tempURL("plain.png")
+        try ImageExporter.write(topRed(30, 30), to: plain, format: .png)
+        #expect(ImageExporter.loadForEditor(from: plain)?.pixelScale == 1)
+    }
+}
+
+@Suite struct TolerantStyleDecodingTests {
+    func json(_ s: AppSettings) throws -> [String: Any] {
+        try #require(try JSONSerialization.jsonObject(with: s.encoded()) as? [String: Any])
+    }
+
+    func encode(_ obj: [String: Any]) throws -> Data { try JSONSerialization.data(withJSONObject: obj) }
+
+    /// CORE_EDITOR-15: one style missing one key used to wipe every remembered tool style.
+    @Test func missingKeyDropsNothing() throws {
+        var s = AppSettings()
+        var rect = ElementStyle.defaults(for: .rectangle); rect.stroke = .black
+        var arrow = ElementStyle.defaults(for: .arrow); arrow.lineWidth = 7
+        s.toolStyles = ["rectangle": rect, "arrow": arrow]
+        var obj = try json(s)
+        var styles = try #require(obj["toolStyles"] as? [String: Any])
+        var a = try #require(styles["arrow"] as? [String: Any])
+        a.removeValue(forKey: "magnification")
+        a["highlightMode"] = "neon" // a case from a newer version
+        styles["arrow"] = a
+        styles["bogus"] = 42         // an entry that isn't a style at all
+        obj["toolStyles"] = styles
+        let back = AppSettings.decode(try encode(obj))
+        #expect(Set(back.toolStyles.keys) == ["rectangle", "arrow"])
+        #expect(back.toolStyles["rectangle"] == rect)
+        #expect(back.toolStyles["arrow"]?.lineWidth == 7 && back.toolStyles["arrow"]?.magnification == 2)
+        #expect(back.toolStyles["arrow"]?.highlightMode == .text)
+    }
+
+    @Test func missingKeyUsesThatToolsDefault() throws {
+        var s = AppSettings()
+        s.toolStyles = ["obfuscate": ElementStyle.defaults(for: .obfuscate)]
+        var obj = try json(s)
+        var styles = try #require(obj["toolStyles"] as? [String: Any])
+        var o = try #require(styles["obfuscate"] as? [String: Any])
+        o.removeValue(forKey: "pixelSize")
+        styles["obfuscate"] = o
+        obj["toolStyles"] = styles
+        #expect(AppSettings.decode(try encode(obj)).toolStyles["obfuscate"]?.pixelSize == 4) // not the generic 8
+    }
+
+    @Test func unknownDestinationDropsOnlyItself() throws {
+        var obj = try json(AppSettings())
+        obj["destinations"] = ["clipboard", "upload", "file"]
+        #expect(AppSettings.decode(try encode(obj)).destinations == [.clipboard, .file])
+        obj["destinations"] = ["upload"]
+        #expect(AppSettings.decode(try encode(obj)).destinations == [.editor])
+    }
+
+    @Test func styleRoundTrips() throws {
+        var st = ElementStyle.defaults(for: .speechBubble)
+        st.bold = true; st.highlightMode = .magnify; st.fontName = "Menlo"
+        let back = try JSONDecoder().decode(ElementStyle.self, from: JSONEncoder().encode(st))
+        #expect(back == st)
+    }
+}
+
+@Suite struct LayeredRenderTests {
+    /// CORE_EDITOR-12: drawing the top of the stack over a cached base must equal a full render,
+    /// filters and counter numbers included.
+    @Test func layeredEqualsFull() throws {
+        let r = Renderer(pixelScale: 1)
+        var s = DocState(image: halves(120, 80))
+        s.elements = [
+            Element(kind: .counter, frame: CGRect(x: 5, y: 5, width: 20, height: 20)),
+            Element(kind: .rectangle, frame: CGRect(x: 30, y: 10, width: 40, height: 30)),
+            { var e = Element(kind: .obfuscate, frame: CGRect(x: 40, y: 20, width: 50, height: 40)); e.style.obfuscateMode = .blur; return e }(),
+            Element(kind: .counter, frame: CGRect(x: 90, y: 50, width: 20, height: 20)),
+        ]
+        let full = try pixels(r.flatten(s))
+        for start in 0...s.elements.count {
+            let base = try #require(r.flattenPrefix(s, count: start))
+            let layered = try pixels(r.flatten(s, over: base, from: start))
+            var diff = 0
+            for y in 0..<80 { for x in 0..<120 where full[x, y].differs(from: layered[x, y], by: 1) { diff += 1 } }
+            #expect(diff == 0, "start \(start): \(diff) px differ")
+        }
     }
 }

@@ -9,11 +9,17 @@ final class HotkeyManager {
     static let shared = HotkeyManager()
 
     var onHotkey: ((HotkeyAction) -> Void)?
+    /// Registration results after a suspension ends (register() itself returns them directly).
+    var onErrors: (([HotkeyAction: String]) -> Void)?
     private var refs: [EventHotKeyRef] = []
     private var idToAction: [UInt32: HotkeyAction] = [:]
     private var handlerInstalled = false
-    /// While the user records a new shortcut in Preferences, the old one must not fire.
+    /// The settings last asked for, re-registered when a suspension ends.
+    private var wanted: AppSettings?
+    /// While the user records a new shortcut in Preferences, the hotkeys are released.
     private(set) var isSuspended = false
+
+    var registeredCount: Int { refs.count }
 
     private init() {}
 
@@ -40,14 +46,34 @@ final class HotkeyManager {
         onHotkey?(action)
     }
 
-    /// Registers every configured hotkey; returns the ones macOS refused (usually: another app owns it).
+    /// Actions whose shortcut equals an earlier action's, mapped to that earlier action. macOS
+    /// would refuse the second registration as "exists", which reads like another app owns it.
+    static func duplicates(in settings: AppSettings) -> [HotkeyAction: HotkeyAction] {
+        var firstUse: [Hotkey: HotkeyAction] = [:]
+        var dups: [HotkeyAction: HotkeyAction] = [:]
+        for action in HotkeyAction.allCases {
+            guard let hk = settings.hotkey(for: action) else { continue }
+            if let earlier = firstUse[hk] { dups[action] = earlier } else { firstUse[hk] = action }
+        }
+        return dups
+    }
+
+    /// Registers every configured hotkey; returns the ones that couldn't be (a duplicate within the
+    /// app, or macOS refused: usually another app owns it). While suspended it only remembers them.
     @discardableResult
     func register(_ settings: AppSettings) -> [HotkeyAction: String] {
+        wanted = settings
+        guard !isSuspended else { return [:] }
         installHandler()
-        unregisterAll()
+        releaseAll()
         var errors: [HotkeyAction: String] = [:]
+        let dups = Self.duplicates(in: settings)
         for (i, action) in HotkeyAction.allCases.enumerated() {
             guard let hk = settings.hotkey(for: action) else { continue }
+            if let other = dups[action] {
+                errors[action] = "Same shortcut as \(other.title)"
+                continue
+            }
             let id = UInt32(i + 1)
             var ref: EventHotKeyRef?
             let status = RegisterEventHotKey(hk.keyCode, hk.modifiers.carbonFlags,
@@ -65,11 +91,28 @@ final class HotkeyManager {
         return errors
     }
 
+    /// Releases every hotkey and forgets the settings (nothing comes back after a suspension).
     func unregisterAll() {
+        releaseAll()
+        wanted = nil
+    }
+
+    private func releaseAll() {
         refs.forEach { UnregisterEventHotKey($0) }
         refs.removeAll()
         idToAction.removeAll()
     }
 
-    func setSuspended(_ s: Bool) { isSuspended = s }
+    /// A registered hotkey is swallowed by the system before any window sees it, so the recorder
+    /// could never record (say) the shortcut of another action. Suspending really unregisters
+    /// them; resuming registers the latest settings again.
+    func setSuspended(_ s: Bool) {
+        guard s != isSuspended else { return }
+        isSuspended = s
+        if s {
+            releaseAll()
+        } else if let wanted {
+            onErrors?(register(wanted))
+        }
+    }
 }

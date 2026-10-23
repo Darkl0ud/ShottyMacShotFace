@@ -152,7 +152,13 @@ public struct AppSettings: Codable, Equatable, Sendable {
         filenamePattern = (try? c.decodeIfPresent(String.self, forKey: .filenamePattern)) ?? d.filenamePattern
         format = (try? c.decodeIfPresent(ImageFormat.self, forKey: .format)) ?? d.format
         jpegQuality = (try? c.decodeIfPresent(Double.self, forKey: .jpegQuality)) ?? d.jpegQuality
-        destinations = (try? c.decodeIfPresent([Destination].self, forKey: .destinations)) ?? d.destinations
+        // One unknown destination (from a newer version) drops only itself, not the whole list.
+        if let raw = (try? c.decodeIfPresent([String].self, forKey: .destinations)) ?? nil {
+            let known = raw.compactMap(Destination.init(rawValue:))
+            destinations = known.isEmpty && !raw.isEmpty ? d.destinations : known
+        } else {
+            destinations = d.destinations
+        }
         captureMousePointer = (try? c.decodeIfPresent(Bool.self, forKey: .captureMousePointer)) ?? d.captureMousePointer
         playSound = (try? c.decodeIfPresent(Bool.self, forKey: .playSound)) ?? d.playSound
         showMagnifier = (try? c.decodeIfPresent(Bool.self, forKey: .showMagnifier)) ?? d.showMagnifier
@@ -162,7 +168,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         lastRegion = (try? c.decodeIfPresent(CGRect.self, forKey: .lastRegion))
         fileCounter = (try? c.decodeIfPresent(Int.self, forKey: .fileCounter)) ?? d.fileCounter
         counterStart = (try? c.decodeIfPresent(Int.self, forKey: .counterStart)) ?? d.counterStart
-        toolStyles = (try? c.decodeIfPresent([String: ElementStyle].self, forKey: .toolStyles)) ?? d.toolStyles
+        toolStyles = ((try? c.decodeIfPresent(ToolStyles.self, forKey: .toolStyles)) ?? nil)?.styles ?? d.toolStyles
     }
 
     public static func decode(_ data: Data) -> AppSettings {

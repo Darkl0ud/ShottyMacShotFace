@@ -15,7 +15,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var busy = false
     private var cancellables = Set<AnyCancellable>()
     private var registeredHotkeys: [String: Hotkey] = [:]
-    private var pendingResult: CaptureResult?
+    /// Seams for the self-test: how a capture's Save As panel and its editor are shown.
+    var presentSaveAs: (CaptureResult, @escaping (URL?) -> Void) -> Void = { r, done in
+        Output.saveAs(r.image, title: r.title, date: r.date, window: nil, completion: done)
+    }
+    var presentEditor: ((EditorDocument) -> Void)?
+    var beep: () -> Void = { NSSound.beep() }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.applicationIconImage = Self.makeAppIcon()
@@ -23,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         setupStatusItem()
 
         HotkeyManager.shared.onHotkey = { [weak self] action in self?.capture(action) }
+        HotkeyManager.shared.onErrors = { [weak self] errors in self?.store.hotkeyErrors = errors }
         registerHotkeys()
         // @Published fires before the value is stored, so re-register on the next turn.
         store.$settings
@@ -31,11 +37,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             .sink { [weak self] _ in DispatchQueue.main.async { self?.registerHotkeys() } }
             .store(in: &cancellables)
 
+        Output.setUpNotifications(askPermission: store.settings.showNotification)
+        store.$settings
+            .map(\.showNotification)
+            .removeDuplicates()
+            .dropFirst()
+            .filter { $0 }
+            .sink { _ in Output.requestNotificationPermission() }
+            .store(in: &cancellables)
+
         // Ask once up front; macOS shows its own prompt and remembers the answer.
         if !ScreenCapturer.hasPermission { CGRequestScreenCaptureAccess() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// Quit (⌘Q, Dock, status menu, logout) never calls windowShouldClose, so without this every
+    /// open capture that exists nowhere else would be thrown away silently.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let pending: [QuitReviewable] = editors.filter(\.hasUnsavedWork)
+        guard !pending.isEmpty else { return .terminateNow }
+        Self.reviewForQuit(pending) { ok in NSApp.reply(toApplicationShouldTerminate: ok) }
+        return .terminateLater
+    }
+
+    /// Asks each editor in turn (Save / Cancel / Don't Save); the first Cancel stops the quit.
+    static func reviewForQuit(_ items: [QuitReviewable], done: @escaping (Bool) -> Void) {
+        guard let first = items.first else { done(true); return }
+        first.confirmDiscardForQuit { ok in
+            if ok { reviewForQuit(Array(items.dropFirst()), done: done) } else { done(false) }
+        }
+    }
 
     private func registerHotkeys() {
         guard store.settings.hotkeys != registeredHotkeys || registeredHotkeys.isEmpty else { return }
@@ -94,7 +126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         menu.addItem(.separator())
         menu.addItem(item("Open Image from File…", #selector(openImageFile)))
         let clip = item("Open Image from Clipboard", #selector(openImageFromClipboard))
-        if NSImage(pasteboard: .general) == nil { clip.action = nil }
+        if !Output.clipboardHasImage() { clip.action = nil }
         menu.addItem(clip)
         let reveal = item("Show Last Capture in Finder", #selector(revealLastCapture))
         if Output.lastSavedURL == nil { reveal.action = nil }
@@ -207,8 +239,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     // MARK: Capturing
 
+    /// Not while another capture runs, nor during an app-modal panel or alert: AppKit gives a
+    /// non-modal window (the overlay) no mouse input then, so it couldn't be used or dismissed.
+    var canStartCapture: Bool { !busy && overlay == nil && NSApp.modalWindow == nil }
+
     func capture(_ action: HotkeyAction) {
-        guard !busy, overlay == nil else { return }
+        guard canStartCapture else {
+            if NSApp.modalWindow != nil { beep() }
+            return
+        }
         busy = true
         capturer.captureCursor = store.settings.captureMousePointer
         capturer.includeWindowShadow = store.settings.windowShadow
@@ -218,16 +257,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 switch action {
                 case .fullScreen:
                     let snap = try await capturer.snapshot()
-                    deliver(CaptureResult(image: snap.image, scale: snap.scale, title: "Full Screen", date: Date()))
+                    guard let c = snap.capture(snap.frame) else { throw CaptureError.noDisplays }
+                    deliver(CaptureResult(image: c.image, scale: c.scale, title: "Full Screen", date: Date()))
                 case .lastRegion:
-                    guard let r = store.settings.lastRegion else {
-                        try await interactiveCapture(startIn: .region) // nothing remembered yet
-                        return
+                    switch Self.lastRegionPlan(store.settings.lastRegion, displays: ScreenCapturer.displayFrames()) {
+                    case .select:
+                        // Nothing remembered yet, or that area is on no display any more.
+                        try await interactiveCapture(startIn: .region)
+                    case .capture(let r):
+                        let snap = try await capturer.snapshot(of: r)
+                        guard let c = snap.capture(r) else { try await interactiveCapture(startIn: .region); return }
+                        deliver(CaptureResult(image: c.image, scale: c.scale,
+                                              title: snap.window(at: r.center)?.displayTitle ?? "Region", date: Date()))
                     }
-                    let snap = try await capturer.snapshot()
-                    guard let img = snap.crop(r) else { return }
-                    deliver(CaptureResult(image: img, scale: snap.scale, title: snap.window(at: r.center)?.displayTitle ?? "Region",
-                                          date: Date()))
                 case .region, .window:
                     try await interactiveCapture(startIn: action == .region ? .region : .window)
                 }
@@ -235,6 +277,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 Output.showError("Capture failed", error)
             }
         }
+    }
+
+    enum LastRegionPlan: Equatable { case select, capture(CGRect) }
+
+    /// Capture Last Region only when some of that area is still on a display; otherwise (display
+    /// unplugged or rearranged) fall back to selecting, instead of silently doing nothing.
+    static func lastRegionPlan(_ r: CGRect?, displays: [CGRect]) -> LastRegionPlan {
+        guard let r else { return .select }
+        let visible = displays.contains { let i = $0.intersection(r); return !i.isNull && i.width >= 1 && i.height >= 1 }
+        return visible ? .capture(r) : .select
     }
 
     private func interactiveCapture(startIn mode: SelectionOverlay.Mode) async throws {
@@ -249,33 +301,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             return
         case .region(let r):
             store.settings.lastRegion = r
-            guard let img = snap.crop(r) else { return }
+            guard let c = snap.capture(r) else { return }
             let title = snap.windows.first { $0.frame.contains(r.center) }?.displayTitle ?? "Region"
-            deliver(CaptureResult(image: img, scale: snap.scale, title: title, date: date))
+            deliver(CaptureResult(image: c.image, scale: c.scale, title: title, date: date))
         case .window(let w):
-            let img: CGImage
+            let shot: (image: CGImage, scale: CGFloat)
             do {
-                img = try await capturer.captureWindow(w)
+                shot = try await capturer.captureWindow(w)
             } catch {
                 // Fall back to the frozen picture of the window's area.
-                guard let crop = snap.crop(w.frame) else { throw error }
-                img = crop
+                guard let crop = snap.capture(w.frame) else { throw error }
+                shot = crop
             }
-            let scale = max(1, (CGFloat(img.width) / max(1, w.frame.width)).rounded())
-            deliver(CaptureResult(image: img, scale: min(scale, snap.scale), title: w.displayTitle, date: date))
+            deliver(CaptureResult(image: shot.image, scale: shot.scale, title: w.displayTitle, date: date))
         }
     }
 
     private func captureRect(_ rect: CGRect, title: String) {
-        guard !busy else { return }
+        guard canStartCapture else { return }
         busy = true
         capturer.captureCursor = store.settings.captureMousePointer
         Task { @MainActor in
             defer { busy = false }
             do {
-                let snap = try await capturer.snapshot()
-                guard let img = snap.crop(rect) else { return }
-                deliver(CaptureResult(image: img, scale: snap.scale, title: title, date: Date()))
+                // Only the display(s) under the rect, at their own resolution.
+                let snap = try await capturer.snapshot(of: rect)
+                guard let c = snap.capture(rect) else { return }
+                deliver(CaptureResult(image: c.image, scale: c.scale, title: title, date: Date()))
             } catch {
                 Output.showError("Capture failed", error)
             }
@@ -295,56 +347,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
     }
 
-    private func run(_ dests: [Destination], _ r: CaptureResult) {
+    func run(_ dests: [Destination], _ r: CaptureResult) {
         var savedURL: URL?
-        for d in dests where d != .editor && d != .ask {
+        var exported = false // the capture now exists outside the editor (C1)
+        for d in dests {
             switch d {
             case .clipboard:
                 Output.copyToClipboard(r.image, pixelScale: r.scale)
+                exported = true
             case .file:
-                do { savedURL = try Output.saveWithPattern(r.image, title: r.title, date: r.date) }
+                do { savedURL = try Output.saveWithPattern(r.image, title: r.title, date: r.date); exported = true }
                 catch { Output.showError("Couldn't save the capture", error) }
-            case .fileAs:
-                Output.saveAs(r.image, title: r.title, date: r.date, window: nil) { _ in }
             default:
                 break
             }
         }
-        // Editor last, so a file saved above becomes the editor's file (⌘S updates it).
-        if dests.contains(.editor) {
-            openEditor(image: r.image, scale: r.scale, title: r.title, date: r.date, fileURL: savedURL)
+        let wantsEditor = dests.contains(.editor)
+        // Editor last, so a file saved above becomes the editor's file (⌘S updates it). Save As is
+        // asynchronous, so the editor waits for its answer.
+        guard dests.contains(.fileAs) else {
+            if wantsEditor { openEditor(image: r.image, scale: r.scale, title: r.title, date: r.date,
+                                        fileURL: savedURL, wasExported: exported) }
+            return
+        }
+        presentSaveAs(r) { [weak self] url in
+            guard let self, wantsEditor else { return }
+            self.openEditor(image: r.image, scale: r.scale, title: r.title, date: r.date,
+                            fileURL: savedURL ?? url, wasExported: exported || url != nil)
         }
     }
 
-    private func showDestinationMenu(_ r: CaptureResult) {
-        pendingResult = r
+    /// What one "Ask each time" menu item does. The capture travels with the items, so it's freed
+    /// with the menu even when the menu is dismissed without a choice.
+    final class DestinationChoice: NSObject {
+        let destination: Destination?
+        let result: CaptureResult
+        init(_ d: Destination?, _ r: CaptureResult) { destination = d; result = r }
+    }
+
+    func makeDestinationMenu(_ r: CaptureResult) -> NSMenu {
         let menu = NSMenu()
         for d in Destination.allCases where d != .ask {
             let i = NSMenuItem(title: d.title, action: #selector(destinationChosen(_:)), keyEquivalent: "")
             i.target = self
-            i.representedObject = d.rawValue
+            i.representedObject = DestinationChoice(d, r)
             menu.addItem(i)
         }
         menu.addItem(.separator())
         let cancel = NSMenuItem(title: "Discard", action: #selector(destinationChosen(_:)), keyEquivalent: "")
         cancel.target = self
+        cancel.representedObject = DestinationChoice(nil, r)
         menu.addItem(cancel)
+        return menu
+    }
+
+    private func showDestinationMenu(_ r: CaptureResult) {
+        let menu = makeDestinationMenu(r)
         NSApp.activate(ignoringOtherApps: true)
         menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
     }
 
-    @objc private func destinationChosen(_ sender: NSMenuItem) {
-        guard let r = pendingResult else { return }
-        pendingResult = nil
-        guard let raw = sender.representedObject as? String, let d = Destination(rawValue: raw) else { return }
-        run([d], r)
+    @objc func destinationChosen(_ sender: NSMenuItem) {
+        guard let choice = sender.representedObject as? DestinationChoice, let d = choice.destination else { return }
+        run([d], choice.result)
     }
 
     // MARK: Editors
 
-    func openEditor(image: CGImage, scale: CGFloat, title: String, date: Date, fileURL: URL? = nil) {
+    /// `wasExported`: the capture already exists outside the editor (saved, copied, or opened from
+    /// a file), so closing the editor needn't ask (C1/C4).
+    func openEditor(image: CGImage, scale: CGFloat, title: String, date: Date, fileURL: URL? = nil,
+                    wasExported: Bool = false) {
         let doc = EditorDocument(image: image, pixelScale: scale, title: title, captureDate: date)
         doc.fileURL = fileURL
+        doc.wasExported = wasExported
+        if let presentEditor { presentEditor(doc); return }
         let ed = EditorWindowController(document: doc)
         ed.host = self
         editors.append(ed)
@@ -373,20 +450,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         panel.allowsMultipleSelection = true
         guard panel.runModal() == .OK else { return }
         for url in panel.urls {
-            guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-                  let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
-            // 144 dpi files are Retina screenshots: treat them as 2x so annotations are sized right.
-            let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
-            let dpi = props?[kCGImagePropertyDPIWidth] as? Double ?? 72
-            let scale: CGFloat = dpi >= 140 ? 2 : 1
-            openEditor(image: img, scale: scale, title: url.deletingPathExtension().lastPathComponent,
-                       date: Date(), fileURL: nil)
+            // Upright (EXIF orientation applied), 144 dpi files as 2x (C2).
+            guard let loaded = ImageExporter.loadForEditor(from: url) else { continue }
+            // The file is the original, so closing unedited needn't ask.
+            openEditor(image: loaded.image, scale: loaded.pixelScale, title: url.deletingPathExtension().lastPathComponent,
+                       date: Date(), fileURL: nil, wasExported: true)
         }
     }
 
     @objc func openImageFromClipboard() {
         guard let img = Output.imageFromClipboard() else { NSSound.beep(); return }
-        openEditor(image: img, scale: 1, title: "Clipboard", date: Date())
+        // It came from the clipboard, so it already exists there, like a capture copied there.
+        openEditor(image: img, scale: 1, title: "Clipboard", date: Date(), wasExported: true)
     }
 
     // MARK: Preferences
@@ -437,6 +512,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
     }
 }
+
+/// Something that may hold work Quit would lose (an editor, per contract C1).
+@MainActor
+protocol QuitReviewable: AnyObject {
+    var hasUnsavedWork: Bool { get }
+    func confirmDiscardForQuit(_ done: @escaping (Bool) -> Void)
+}
+
+extension EditorWindowController: QuitReviewable {}
 
 /// The menu bar shown while an editor or Preferences is in front.
 @MainActor

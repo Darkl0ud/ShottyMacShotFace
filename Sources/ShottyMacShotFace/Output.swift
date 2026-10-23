@@ -21,6 +21,12 @@ enum Output {
         pb.writeObjects([item])
     }
 
+    /// Whether the clipboard holds a picture, without reading it: right after a capture it holds a
+    /// PNG plus an uncompressed TIFF (tens of MB), and this runs every time the status menu opens.
+    static func clipboardHasImage(_ pb: NSPasteboard = .general) -> Bool {
+        pb.canReadObject(forClasses: [NSImage.self], options: nil)
+    }
+
     static func imageFromClipboard() -> CGImage? {
         guard let ns = NSImage(pasteboard: NSPasteboard.general) else { return nil }
         var r = CGRect(origin: .zero, size: ns.size)
@@ -87,8 +93,10 @@ enum Output {
             }
         }
         NSApp.activate(ignoringOtherApps: true)
+        // Never runModal here: callers run inside main-actor Tasks, and a modal loop inside one
+        // stalls every other main-actor job (hotkeys included) until the panel closes.
         if let window { panel.beginSheetModal(for: window, completionHandler: finish) }
-        else { finish(panel.runModal()) }
+        else { panel.begin(completionHandler: finish) }
     }
 
     static func didSave(_ url: URL) {
@@ -104,21 +112,42 @@ enum Output {
         (NSSound(contentsOfFile: path, byReference: true) ?? NSSound(named: "Tink"))?.play()
     }
 
+    /// UNUserNotificationCenter crashes in a process without a bundle id (e.g. the raw binary).
+    static var notificationsAvailable: Bool { Bundle.main.bundleIdentifier != nil }
+
+    /// At launch: install the delegate that lets banners show while the app is in front (without
+    /// one, macOS silences every notification of a foreground app, i.e. every editor save), and
+    /// ask for permission once, only if the user wants notifications.
+    static func setUpNotifications(askPermission: Bool) {
+        guard notificationsAvailable else { return }
+        UNUserNotificationCenter.current().delegate = NotificationPresenter.shared
+        if askPermission { requestNotificationPermission() }
+    }
+
+    static func requestNotificationPermission() {
+        guard notificationsAvailable else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
+    }
+
     static func notify(title: String, body: String) {
-        // UNUserNotificationCenter crashes in a process without a bundle id (e.g. the raw binary).
-        guard Bundle.main.bundleIdentifier != nil else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { granted, _ in
-            guard granted else { return }
-            let content = UNMutableNotificationContent()
-            content.title = title
-            content.body = body
-            // Looked up again inside the callback: the center object isn't Sendable across threads.
-            UNUserNotificationCenter.current()
-                .add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        guard notificationsAvailable else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        // Without permission this simply isn't shown.
+        UNUserNotificationCenter.current()
+            .add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+
+    /// Shown from a run-loop callback rather than right away: callers are often inside a main-actor
+    /// Task, and a modal alert run there blocks every other main-actor job until it's dismissed.
+    static func showError(_ message: String, _ error: Error) {
+        RunLoop.main.perform(inModes: [.common]) {
+            MainActor.assumeIsolated { presentError(message, error) }
         }
     }
 
-    static func showError(_ message: String, _ error: Error) {
+    private static func presentError(_ message: String, _ error: Error) {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = message
@@ -135,6 +164,17 @@ enum Output {
         }
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
+    }
+}
+
+/// Lets "Screenshot saved" banners appear while the app is frontmost (saving from the editor).
+final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = NotificationPresenter()
+    static let foregroundOptions: UNNotificationPresentationOptions = [.banner, .list]
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler(Self.foregroundOptions)
     }
 }
 

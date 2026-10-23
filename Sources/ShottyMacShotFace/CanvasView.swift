@@ -30,8 +30,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
     var tool: Tool = .select {
         didSet {
             guard tool != oldValue else { return }
+            // A tool key (V, Esc, R…) can arrive while the mouse button is still down. Finish that
+            // drag now; left running, a crop drag kept redrawing its rectangle in Select mode.
+            finishDrag(shift: false)
             endTextEdit()
             if tool != .crop { cropRect = nil }
+            // Greenshot behaviour: picking a drawing tool deselects, so property changes made for
+            // the new tool can't restyle a shape of another kind that happened to be selected.
+            if tool.kind != nil { setSelection([]) }
             window?.invalidateCursorRects(for: self)
             delegate?.canvasToolChanged()
             needsDisplay = true
@@ -47,6 +53,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var cache: CGImage?
     private var fastBackground: CGImage?
     private var fastID: UUID?
+    /// Everything below the dragged element(s), for drags the single-element fast path can't do
+    /// (filters, elements under others, multi-selection moves).
+    private var layerBase: CGImage?
+    private var layerBaseIndex = -1
+    private var lastDocSize: CGSize = .zero
 
     private enum Drag {
         case none
@@ -59,6 +70,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var drag: Drag = .none
     private var textView: NSTextView?
     private(set) var editingID: UUID?
+    /// A text box created by the current click/drag: its creation stays one open live change
+    /// until the typing ends, so create + type is one undo step and an empty box leaves no trace.
+    private var newTextID: UUID?
+
+    /// True between mouse-down and mouse-up of a canvas drag. Menu commands that change the
+    /// document are disabled meanwhile (see EditorWindowController.validateMenuItem).
+    var isDragging: Bool { if case .none = drag { return false }; return true }
 
     static let toolKeys: [String: Tool] = [
         "v": .select, "r": .draw(.rectangle), "e": .draw(.ellipse), "l": .draw(.line), "a": .draw(.arrow),
@@ -69,6 +87,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     init(document: EditorDocument, renderer: Renderer) {
         doc = document
         self.renderer = renderer
+        lastDocSize = document.state.size
         super.init(frame: .zero)
         // Since macOS 14 views don't clip their drawing to their bounds by default; anything drawn
         // past the edge showed up as a strip beside the picture.
@@ -104,8 +123,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let valid = selection.filter { doc.element($0) != nil }
         if valid != selection { selection = valid; delegate?.canvasSelectionChanged() }
         if editingID.map({ doc.element($0) == nil }) == true { endTextEdit(commit: false) }
+        if !isDragging { layerBase = nil }
         let s = doc.state.size
+        if s != lastDocSize {
+            // A crop rectangle drawn on the old geometry (before a rotate, resize, shadow, undo
+            // of a crop…) would cut the wrong area.
+            lastDocSize = s
+            if cropRect != nil { cropRect = nil; delegate?.canvasCropChanged() }
+        }
         if frame.size != NSSize(width: (s.width * zoom).rounded(), height: (s.height * zoom).rounded()) { updateSize() }
+        // Keep the text being typed in the font/size/colour just picked, not the old one.
+        if editingID != nil { positionTextView() }
         needsDisplay = true
     }
 
@@ -145,6 +173,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
             Bitmap.drawImage(bg, in: canvas, ctx: ctx)
             renderer.draw(e, number: doc.counterNumber(for: e.id) ?? 0, in: ctx, canvas: canvas,
                           deviceScale: zoom * (window?.backingScaleFactor ?? 2))
+        } else if let frame = layeredFrame() {
+            Bitmap.drawImage(frame, in: canvas, ctx: ctx)
         } else {
             if cache == nil { cache = renderer.flatten(doc.state, excluding: editingID.map { [$0] } ?? []) }
             if let c = cache { Bitmap.drawImage(c, in: canvas, ctx: ctx) }
@@ -169,6 +199,30 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
         return fastBackground.map { ($0, e) }
     }
+
+    /// Any other drag: reuse a picture of everything below the lowest dragged element, and only
+    /// re-render from there up. Dragging a blur box no longer re-runs every filter under it on
+    /// each mouse event (filters above it still must, since they read the pixels it changes).
+    private func layeredFrame() -> CGImage? {
+        guard editingID == nil else { return nil }
+        let ids: Set<UUID>
+        switch drag {
+        case .creating(let i, _): ids = [i]
+        case .resizing(let i, _): ids = [i]
+        case .moving(_, let originals): ids = Set(originals.keys)
+        default: return nil
+        }
+        guard let start = doc.state.elements.firstIndex(where: { ids.contains($0.id) }) else { return nil }
+        if layerBase == nil || layerBaseIndex != start {
+            layerBase = renderer.flattenPrefix(doc.state, count: start)
+            layerBaseIndex = start
+        }
+        guard let base = layerBase else { return nil }
+        return renderer.flatten(doc.state, over: base, from: start)
+    }
+
+    /// For the self-check: one drag frame rendered the way draw() would, and the full re-render.
+    func renderDragFrameForTesting() -> CGImage? { layeredFrame() }
 
     private func drawChecker(_ ctx: CGContext, in r: CGRect) {
         guard !r.isNull else { return }
@@ -254,6 +308,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     override func mouseDown(with event: NSEvent) {
+        // A drag whose mouse-up never arrived (e.g. the capture overlay opened mid-drag).
+        if isDragging { finishDrag(shift: false) }
         if editingID != nil { endTextEdit() }
         window?.makeFirstResponder(self)
         let p = docPoint(event)
@@ -380,6 +436,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             drag = .rubberBand(start: start, current: p)
             needsDisplay = true
         case .cropping(let start):
+            guard tool == .crop else { break }
             let r = CGRect(corner: start, p).intersection(doc.state.canvasRect)
             cropRect = r.isNull ? nil : r
             delegate?.canvasCropChanged()
@@ -391,25 +448,38 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     override func mouseUp(with event: NSEvent) {
-        let shift = event.modifierFlags.contains(.shift)
-        switch drag {
+        finishDrag(shift: event.modifierFlags.contains(.shift))
+    }
+
+    /// Ends the current drag the way a mouse-up would. Safe to call when nothing is dragging.
+    private func finishDrag(shift: Bool) {
+        let ending = drag
+        // Reset first: finishing can start a text edit, which must not see a drag in progress.
+        drag = .none
+        switch ending {
         case .creating(let id, _):
             finishCreating(id)
         case .moving, .resizing:
             doc.endLiveChange()
         case .rubberBand(let a, let b):
             let r = CGRect(corner: a, b)
-            let hits = Set(doc.state.elements.filter { $0.bounds.insetBy(dx: -1, dy: -1).intersects(r) }.map(\.id))
-            setSelection(shift ? selection.union(hits) : hits)
+            let v = viewRect(r)
+            // A plain click on empty space already deselected in mouseDown. Its zero-size "band"
+            // would still intersect the bounding box of a diagonal arrow it doesn't touch.
+            if max(v.width, v.height) >= 3 {
+                let hits = Set(doc.state.elements.filter { $0.bounds.insetBy(dx: -1, dy: -1).intersects(r) }.map(\.id))
+                setSelection(shift ? selection.union(hits) : hits)
+            }
         case .cropping:
             if let c = cropRect, c.width < 2 || c.height < 2 { cropRect = nil }
             delegate?.canvasCropChanged()
         case .none:
-            break
+            return
         }
-        drag = .none
         fastBackground = nil
         fastID = nil
+        layerBase = nil
+        cache = nil
         needsDisplay = true
     }
 
@@ -440,9 +510,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
             doc.cancelLiveChange()
             return
         }
-        doc.endLiveChange()
         setSelection([id])
-        if e.kind.hasText { beginTextEdit(id) }
+        if e.kind.hasText {
+            // The live change stays open until the typing ends (endTextEdit).
+            beginTextEdit(id)
+            newTextID = id
+            return
+        }
+        doc.endLiveChange()
     }
 
     // MARK: Trackpad zoom
@@ -503,7 +578,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     private func nudge(keyCode: Int, step: CGFloat) {
-        guard !selection.isEmpty else { return }
+        guard !selection.isEmpty, !isDragging else { return }
         // Steps are in screen points, so a nudge looks the same at any zoom.
         let k = step / zoom
         let d: CGPoint
@@ -520,7 +595,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
     // MARK: Operations used by the controller
 
     func deleteSelection() {
-        guard !selection.isEmpty else { return }
+        // Keys and menu shortcuts still arrive while the mouse button is held; editing the
+        // document under a drag would tangle its undo history.
+        guard !selection.isEmpty, !isDragging else { return }
         doc.remove(selection)
         setSelection([])
     }
@@ -531,12 +608,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     func reorder(_ z: EditorDocument.ZOrder) {
-        guard !selection.isEmpty else { return }
+        guard !selection.isEmpty, !isDragging else { return }
         doc.reorder(selection, z)
     }
 
     func duplicateSelection() {
-        guard !selection.isEmpty else { return }
+        guard !selection.isEmpty, !isDragging else { return }
         setSelection(doc.duplicate(selection, offset: 10 * doc.pixelScale))
     }
 
@@ -560,21 +637,33 @@ final class CanvasView: NSView, NSTextViewDelegate {
         needsDisplay = true
     }
 
-    /// Applies a style tweak to every selected element as one undo step.
-    func applyStyleToSelection(_ change: (inout ElementStyle) -> Void) {
-        guard !selection.isEmpty else { return }
-        let ids = selection
-        doc.mutate { st in
-            for i in st.elements.indices where ids.contains(st.elements[i].id) { change(&st.elements[i].style) }
+    /// Applies a style tweak to the selected elements (all of them, or only those of `kind`)
+    /// as one undo step. Text boxes grow to fit a bigger font; counters take their size from it.
+    func applyStyleToSelection(only kind: ElementKind? = nil, _ change: (inout ElementStyle) -> Void) {
+        let ids = selection.filter { id in kind.map { doc.element(id)?.kind == $0 } ?? true }
+        guard !ids.isEmpty else { return }
+        let s = doc.pixelScale
+        let body: (inout DocState) -> Void = { st in
+            for i in st.elements.indices where ids.contains(st.elements[i].id) {
+                var e = st.elements[i]
+                let before = e.style
+                change(&e.style)
+                if e.kind == .counter, e.style.fontSize != before.fontSize {
+                    let d = e.style.fontSize * 2 * s
+                    e.frame = CGRect(x: e.frame.midX - d / 2, y: e.frame.midY - d / 2, width: d, height: d)
+                }
+                if e.kind.hasText { e.frame = Renderer.frameFittingText(e, pixelScale: s) }
+                st.elements[i] = e
+            }
         }
+        // While a just-created text box is being typed into, its creation is still one open
+        // live change: fold the style tweak into it so create + style + type stays one step.
+        if doc.isInLiveChange, !isDragging { doc.mutateLive(body) } else { doc.mutate(body) }
     }
 
     // MARK: Text editing
 
-    private func textRect(_ e: Element) -> CGRect {
-        let s = doc.pixelScale
-        return e.kind == .speechBubble ? e.frame.insetBy(dx: 8 * s, dy: 6 * s) : e.frame.insetBy(dx: 4 * s, dy: 2 * s)
-    }
+    private func textRect(_ e: Element) -> CGRect { Renderer.textRect(for: e, pixelScale: doc.pixelScale) }
 
     func beginTextEdit(_ id: UUID) {
         guard let e = doc.element(id), e.kind.hasText else { return }
@@ -587,37 +676,73 @@ final class CanvasView: NSView, NSTextViewDelegate {
         tv.drawsBackground = false
         tv.textContainerInset = .zero
         tv.textContainer?.lineFragmentPadding = 0
-        tv.alignment = e.kind == .speechBubble ? .center : .left
-        tv.font = Renderer.font(for: e.style, pixelScale: doc.pixelScale, sizeOverride: e.style.fontSize * doc.pixelScale * zoom)
-        tv.textColor = NSColor(cgColor: e.style.stroke.cgColor) ?? .black
-        tv.insertionPointColor = NSColor(cgColor: e.style.stroke.cgColor) ?? .black
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
         tv.delegate = self
         addSubview(tv)
         textView = tv
+        positionTextView()
         window?.makeFirstResponder(tv)
         tv.selectAll(nil)
         cache = nil
         needsDisplay = true
     }
 
+    /// Lays the text overlay over the box in the element's current style. Runs on zoom, on
+    /// every document change (a font/size/colour picked mid-typing) and on every keystroke.
     private func positionTextView() {
         guard let tv = textView, let id = editingID, let e = doc.element(id) else { return }
-        tv.frame = viewRect(textRect(e))
+        let r = viewRect(textRect(e))
+        tv.alignment = e.kind == .speechBubble ? .center : .left
         tv.font = Renderer.font(for: e.style, pixelScale: doc.pixelScale, sizeOverride: e.style.fontSize * doc.pixelScale * zoom)
+        let color = NSColor(cgColor: e.style.stroke.cgColor) ?? .black
+        tv.textColor = color
+        tv.insertionPointColor = color
+        // Size the overlay with the renderer's own measurement, so what you see while typing is
+        // exactly the box that gets committed (endTextEdit grows the element the same way).
+        let need = Renderer.textHeight(tv.string, style: e.style, pixelScale: doc.pixelScale,
+                                       width: textRect(e).width, center: e.kind == .speechBubble) * zoom
+        // The renderer centres bubble text vertically; do the same here so it doesn't jump on commit.
+        let inset = e.kind == .speechBubble ? max(0, (r.height - need) / 2) : 0
+        tv.textContainerInset = NSSize(width: 0, height: inset)
+        tv.minSize = r.size
+        tv.maxSize = NSSize(width: r.width, height: .greatestFiniteMagnitude)
+        tv.frame = CGRect(x: r.minX, y: r.minY, width: r.width, height: max(r.height, need + 2 * inset))
     }
+
+    func textDidChange(_ notification: Notification) { positionTextView() }
 
     func endTextEdit(commit: Bool = true) {
         guard let id = editingID, let tv = textView else { return }
         let text = tv.string
+        // Still the open creation step of a box made by the last click (see finishCreating)?
+        let isNew = newTextID == id && doc.isInLiveChange
+        newTextID = nil
         editingID = nil
         textView = nil
         tv.removeFromSuperview()
         if commit, let e = doc.element(id) {
             if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, e.kind == .text {
-                doc.remove([id])
-            } else if text != e.text {
-                doc.update(id) { $0.text = text }
+                // A new box left empty leaves no trace in the history; emptying an old one deletes it.
+                if isNew { doc.cancelLiveChange() } else { doc.remove([id]) }
+            } else {
+                var typed = e
+                typed.text = text
+                // Grow the box to fit every line, in the same step as the text itself.
+                let frame = Renderer.frameFittingText(typed, pixelScale: doc.pixelScale)
+                if isNew {
+                    doc.mutateLive { st in
+                        guard let i = st.elements.firstIndex(where: { $0.id == id }) else { return }
+                        st.elements[i].text = text
+                        st.elements[i].frame = frame
+                    }
+                    doc.endLiveChange()
+                } else if text != e.text || frame != e.frame {
+                    doc.update(id) { $0.text = text; $0.frame = frame }
+                }
             }
+        } else if isNew {
+            doc.endLiveChange()
         }
         cache = nil
         window?.makeFirstResponder(self)

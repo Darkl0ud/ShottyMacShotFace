@@ -15,16 +15,30 @@ public final class Renderer {
     /// The whole document as one image. `excluding` leaves elements out (the one being dragged,
     /// or the text box being typed into) while still counting them for step-counter numbering.
     public func flatten(_ s: DocState, excluding: Set<UUID> = []) -> CGImage? {
+        flatten(s, over: s.image, from: 0, excluding: excluding)
+    }
+
+    /// Draws `elements[from...]` over `base`, which must already show the picture with
+    /// `elements[..<from]` on it (e.g. a cached `flatten(prefix)`). Lets the editor re-render only
+    /// what lies above a dragged element instead of the whole stack, which matters for filters.
+    public func flatten(_ s: DocState, over base: CGImage, from start: Int, excluding: Set<UUID> = []) -> CGImage? {
         Bitmap.render(width: s.image.width, height: s.image.height, colorSpace: s.image.colorSpace) { ctx in
-            Bitmap.drawImage(s.image, in: s.canvasRect, ctx: ctx)
+            Bitmap.drawImage(base, in: s.canvasRect, ctx: ctx)
             var counter = counterStart
-            for e in s.elements {
+            for (i, e) in s.elements.enumerated() {
                 var number = 0
                 if e.kind == .counter { number = counter; counter += 1 }
-                if excluding.contains(e.id) { continue }
+                if i < start || excluding.contains(e.id) { continue }
                 draw(e, number: number, in: ctx, canvas: s.canvasRect, deviceScale: 1)
             }
         }
+    }
+
+    /// The same picture with only `elements[..<count]` on it: the cached base for the call above.
+    public func flattenPrefix(_ s: DocState, count: Int) -> CGImage? {
+        var p = s
+        p.elements = Array(s.elements.prefix(max(0, count)))
+        return flatten(p)
     }
 
     /// `deviceScale` = device pixels per document pixel. Only shadows need it, because Quartz
@@ -80,7 +94,7 @@ public final class Renderer {
             withShadow(e, ctx, deviceScale) {
                 if !st.fill.isClear { ctx.setFillColor(st.fill.cgColor); ctx.fill(e.frame) }
                 strokeShape(ctx, lw: lw, color: st.stroke, frame: e.frame) { ctx.addRect($0) }
-                drawText(e.text, in: e.frame.insetBy(dx: 4 * s, dy: 2 * s), style: st, ctx: ctx, center: false)
+                drawText(e.text, in: Self.textRect(for: e, pixelScale: s), style: st, ctx: ctx, center: false)
             }
 
         case .speechBubble:
@@ -92,7 +106,7 @@ public final class Renderer {
                     ctx.setLineWidth(lw); ctx.setLineJoin(.round); ctx.strokePath()
                 }
             }
-            drawText(e.text, in: e.frame.insetBy(dx: 8 * s, dy: 6 * s), style: st, ctx: ctx, center: true)
+            drawText(e.text, in: Self.textRect(for: e, pixelScale: s), style: st, ctx: ctx, center: true)
 
         case .counter:
             withShadow(e, ctx, deviceScale) {
@@ -196,17 +210,47 @@ public final class Renderer {
         return f
     }
 
-    private func drawText(_ text: String, in rect: CGRect, style st: ElementStyle, ctx: CGContext, center: Bool) {
-        guard !text.isEmpty, rect.width > 0, rect.height > 0 else { return }
+    /// Where the words go inside a text box or speech bubble (document pixels).
+    public static func textRect(for e: Element, pixelScale s: CGFloat) -> CGRect {
+        e.kind == .speechBubble ? e.frame.insetBy(dx: 8 * s, dy: 6 * s) : e.frame.insetBy(dx: 4 * s, dy: 2 * s)
+    }
+
+    static func attributedText(_ text: String, style st: ElementStyle, pixelScale: CGFloat, center: Bool) -> NSAttributedString {
         let para = NSMutableParagraphStyle()
         para.alignment = center ? .center : .left
         para.lineBreakMode = .byWordWrapping
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: Self.font(for: st, pixelScale: pixelScale),
+        return NSAttributedString(string: text, attributes: [
+            .font: font(for: st, pixelScale: pixelScale),
             .foregroundColor: NSColor(cgColor: st.stroke.cgColor) ?? .black,
             .paragraphStyle: para,
-        ]
-        let str = NSAttributedString(string: text, attributes: attrs)
+        ])
+    }
+
+    /// Height the text needs at `width`, measured exactly the way drawText lays it out.
+    public static func textHeight(_ text: String, style: ElementStyle, pixelScale: CGFloat, width: CGFloat,
+                                  center: Bool = false) -> CGFloat {
+        // An empty last line (text ending in Return) still takes a line, as in the text view.
+        let t = text.isEmpty || text.hasSuffix("\n") ? text + " " : text
+        let str = attributedText(t, style: style, pixelScale: pixelScale, center: center)
+        return str.boundingRect(with: CGSize(width: max(1, width), height: .greatestFiniteMagnitude),
+                                options: [.usesLineFragmentOrigin, .usesFontLeading]).height.rounded(.up)
+    }
+
+    /// The element's frame, grown downwards (never shrunk) so all of its text fits. drawText clips
+    /// to the box, so without this a second line or a wrapped sentence was silently cut off.
+    public static func frameFittingText(_ e: Element, pixelScale s: CGFloat) -> CGRect {
+        guard e.kind.hasText, !e.text.isEmpty else { return e.frame }
+        let inner = textRect(for: e, pixelScale: s)
+        let need = textHeight(e.text, style: e.style, pixelScale: s, width: inner.width, center: e.kind == .speechBubble)
+        let pad = e.frame.height - inner.height // 4 pt for text boxes, 12 pt for bubbles
+        var f = e.frame
+        f.size.height = max(f.height, need + pad + 1)
+        return f
+    }
+
+    private func drawText(_ text: String, in rect: CGRect, style st: ElementStyle, ctx: CGContext, center: Bool) {
+        guard !text.isEmpty, rect.width > 0, rect.height > 0 else { return }
+        let str = Self.attributedText(text, style: st, pixelScale: pixelScale, center: center)
         var target = rect
         if center {
             let h = str.boundingRect(with: CGSize(width: rect.width, height: .greatestFiniteMagnitude),

@@ -34,8 +34,13 @@ public final class EditorDocument {
     public private(set) var undoStack: [DocState] = []
     public private(set) var redoStack: [DocState] = []
     private var savedState: DocState?
+    /// The state that last left the editor (saved to a file or copied to the clipboard).
+    private var exportedState: DocState?
     private var liveChangeStart: DocState?
     private let undoLimit = 100
+    /// Undo keeps every old picture alive, and each effect step on a 5K capture is a new ~59 MB
+    /// bitmap, so the history is also capped by the memory its pictures hold (oldest go first).
+    public var undoMemoryLimit = 1 << 30
 
     public init(image: CGImage, pixelScale: CGFloat = 1, title: String = "", captureDate: Date = Date()) {
         self.state = DocState(image: image)
@@ -45,28 +50,58 @@ public final class EditorDocument {
         self.savedState = state
     }
 
+    /// Differs from the last file save (drives the title bar's edited dot for opened files).
     public var isDirty: Bool { savedState.map { $0 != state } ?? true }
     public var canUndo: Bool { !undoStack.isEmpty }
     public var canRedo: Bool { !redoStack.isEmpty }
-    public func markSaved() { savedState = state }
+    public func markSaved() {
+        savedState = state
+        exportedState = state
+    }
+
+    /// True when the capture already exists outside the editor (saved to a file, or copied to the
+    /// clipboard). Setting it records the current state as the exported one, so later edits
+    /// still count as unexported work.
+    public var wasExported: Bool {
+        get { exportedState != nil }
+        set { exportedState = newValue ? state : nil }
+    }
+
+    /// Closing would lose something: either the capture was never saved or copied anywhere, or
+    /// it has changed since it last was. A brand-new capture counts, because with the default
+    /// "Open in editor" destination the editor holds the only copy.
+    public var hasUnexportedChanges: Bool { exportedState.map { $0 != state } ?? true }
 
     // MARK: Mutation
 
     /// One undoable step.
     public func mutate(_ body: (inout DocState) -> Void) {
+        // A menu shortcut can arrive mid-drag; committing the drag first keeps the history linear
+        // (otherwise the drag's start state would later be restored over this step).
+        endLiveChange()
         var next = state
         body(&next)
         guard next != state else { return }
         pushUndo(state)
         state = next
+        trimUndoMemory() // after `state` moves on: the old picture now lives only in the history
         onChange?()
     }
 
     /// Mouse drags change the document many times per second but should undo as one step:
     /// begin → mutateLive (repeated) → end.
-    public func beginLiveChange() { liveChangeStart = state }
+    public func beginLiveChange() {
+        // A drag whose mouse-up never came must not silently lose its start state.
+        endLiveChange()
+        liveChangeStart = state
+    }
+
+    public var isInLiveChange: Bool { liveChangeStart != nil }
 
     public func mutateLive(_ body: (inout DocState) -> Void) {
+        // Never change the document without a way back: an undo mid-drag ends the live change,
+        // and the rest of that drag becomes a new one.
+        if liveChangeStart == nil { liveChangeStart = state }
         body(&state)
         onChange?()
     }
@@ -75,6 +110,7 @@ public final class EditorDocument {
         defer { liveChangeStart = nil }
         guard let start = liveChangeStart, start != state else { return }
         pushUndo(start)
+        trimUndoMemory()
         onChange?()
     }
 
@@ -90,7 +126,23 @@ public final class EditorDocument {
         redoStack.removeAll()
     }
 
+    /// Bytes held by pictures that only the history keeps alive (each distinct image once;
+    /// annotation-only steps share the same image and cost nothing extra).
+    public var undoImageBytes: Int {
+        var seen: Set<ObjectIdentifier> = [ObjectIdentifier(state.image)]
+        var total = 0
+        for s in undoStack + redoStack where seen.insert(ObjectIdentifier(s.image)).inserted {
+            total += s.image.bytesPerRow * s.image.height
+        }
+        return total
+    }
+
+    private func trimUndoMemory() {
+        while !undoStack.isEmpty, undoImageBytes > undoMemoryLimit { undoStack.removeFirst() }
+    }
+
     public func undo() {
+        endLiveChange()
         guard let prev = undoStack.popLast() else { return }
         redoStack.append(state)
         state = prev
@@ -98,6 +150,7 @@ public final class EditorDocument {
     }
 
     public func redo() {
+        endLiveChange()
         guard let next = redoStack.popLast() else { return }
         undoStack.append(state)
         state = next

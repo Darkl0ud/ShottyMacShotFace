@@ -7,6 +7,21 @@ import SwiftUI
 /// so with just the Command Line Tools the state lives in a plain ObservableObject instead.
 final class PreferencesUIModel: ObservableObject {
     @Published var loginError: String?
+    /// SMAppService.status isn't observable, so it's re-read into here after each change.
+    @Published var loginStatus: SMAppService.Status = SMAppService.mainApp.status
+}
+
+/// What the "Open at login" row shows for a login-item status.
+enum LoginItemUI {
+    /// On once registered, including while macOS still waits for the user's approval: the request
+    /// stands, and showing "off" would hide that anything happened.
+    static func isOn(_ s: SMAppService.Status) -> Bool { s == .enabled || s == .requiresApproval }
+
+    static func hint(_ s: SMAppService.Status) -> String? {
+        s == .requiresApproval
+            ? "macOS needs your OK: turn ShottyMacShotFace on under Login Items in System Settings."
+            : nil
+    }
 }
 
 /// Preferences window, in SwiftUI because it's mostly forms bound straight to settings.
@@ -103,7 +118,7 @@ private struct CaptureTab: View {
 
     private var launchAtLogin: Binding<Bool> {
         Binding(
-            get: { SMAppService.mainApp.status == .enabled },
+            get: { LoginItemUI.isOn(ui.loginStatus) },
             set: { on in
                 do {
                     if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
@@ -111,6 +126,7 @@ private struct CaptureTab: View {
                 } catch {
                     ui.loginError = error.localizedDescription
                 }
+                ui.loginStatus = SMAppService.mainApp.status
             })
     }
 
@@ -135,9 +151,19 @@ private struct CaptureTab: View {
             Section("System") {
                 Toggle("Open at login", isOn: launchAtLogin)
                 if let err = ui.loginError { Text(err).font(.caption).foregroundStyle(.red) }
+                if let hint = LoginItemUI.hint(ui.loginStatus) {
+                    Text(hint).font(.caption).foregroundStyle(.orange)
+                    Button("Open Login Items Settings…") { SMAppService.openSystemSettingsLoginItems() }
+                        .controlSize(.small)
+                }
             }
         }
         .formStyle(.grouped)
+        // Approval can be given in System Settings while Preferences is open.
+        .onAppear { ui.loginStatus = SMAppService.mainApp.status }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            ui.loginStatus = SMAppService.mainApp.status
+        }
     }
 }
 
@@ -209,20 +235,54 @@ final class RecorderButton: NSButton {
         title = isRecording ? "Type shortcut…" : (hotkey?.display ?? "None")
     }
 
-    @objc private func toggle() { isRecording ? stop() : start() }
+    @objc func toggle() { isRecording ? stop() : start() }
+
+    private var stopTriggers: [NSObjectProtocol] = []
+    private var clickMonitor: Any?
 
     private func start() {
         isRecording = true
-        // Carbon hotkeys fire before the app sees the keys, so pause them while recording.
+        // Carbon hotkeys are swallowed before the app sees the keys, so release them while recording.
         HotkeyManager.shared.setSuspended(true)
         window?.makeFirstResponder(self)
+        watchForLeaving()
         refreshTitle()
     }
 
-    private func stop() {
+    func stop() {
+        guard isRecording else { return }
         isRecording = false
+        for o in stopTriggers { NotificationCenter.default.removeObserver(o) }
+        stopTriggers.removeAll()
+        if let m = clickMonitor { NSEvent.removeMonitor(m) }
+        clickMonitor = nil
         HotkeyManager.shared.setSuspended(false)
         refreshTitle()
+    }
+
+    /// Recording (and with it, every global hotkey) must not outlive the user's attention: switching
+    /// apps or windows, or clicking anywhere else, ends it. None of those move the first responder,
+    /// so resignFirstResponder alone left the hotkeys dead indefinitely.
+    private func watchForLeaving() {
+        let nc = NotificationCenter.default
+        let end: (Notification) -> Void = { [weak self] _ in MainActor.assumeIsolated { self?.stop() } }
+        stopTriggers.append(nc.addObserver(forName: NSApplication.didResignActiveNotification, object: nil,
+                                           queue: .main, using: end))
+        if let window {
+            stopTriggers.append(nc.addObserver(forName: NSWindow.didResignKeyNotification, object: window,
+                                               queue: .main, using: end))
+        }
+        clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] e in
+            guard let self, self.isRecording else { return e }
+            let inside = e.window === self.window && self.bounds.contains(self.convert(e.locationInWindow, from: nil))
+            if !inside { self.stop() }
+            return e
+        }
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil { stop() }
+        super.viewWillMove(toWindow: newWindow)
     }
 
     override func resignFirstResponder() -> Bool {

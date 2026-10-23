@@ -42,14 +42,28 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     private let obfuscatePopup = NSPopUpButton()
     private let strengthPopup = NSPopUpButton()
     private let magnifyPopup = NSPopUpButton()
+    private let counterSizePopup = NSPopUpButton()
     private let zoomPopup = NSPopUpButton()
     private var groups: [String: NSView] = [:]
     private var isUpdatingControls = false
+    /// "Don't Save" was chosen: closing (or quitting) goes ahead without asking again.
+    /// Any later edit clears it.
+    private var discardConfirmed = false
+
+    /// Test seams for the self-checks, so they never show a real sheet, write a real file or
+    /// touch the user's saved tool styles. nil in the app.
+    var savePromptResponder: ((NSAlert) -> NSApplication.ModalResponse)?
+    var saveActionForTesting: (() -> Bool)?
+    var toolStylesForTesting: [ElementKind: ElementStyle]?
 
     static let thicknesses: [CGFloat] = [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20]
     static let fontSizes: [CGFloat] = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64, 72, 96]
     static let strengths: [CGFloat] = [2, 3, 4, 6, 8, 10, 12, 16, 20, 30]
     static let magnifications: [CGFloat] = [1.5, 2, 3, 4, 6]
+    /// Step counter diameters (pt). A counter's diameter is twice its style's fontSize.
+    static let counterSizes: [CGFloat] = [16, 20, 24, 28, 32, 40, 48, 64, 80, 96]
+    /// Zoom pop-up tags: presets use their index; one reusable item shows any other zoom.
+    static let fitZoomTag = 1000, customZoomTag = 999
     /// Zoom presets relative to the capture's real size (100% = one image pixel per screen pixel).
     static let zoomLevels: [CGFloat] = [0.1, 0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.5, 2, 3, 4, 6, 8]
 
@@ -104,7 +118,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         actions.spacing = 4
 
         buildPropertyControls()
-        let props = NSStackView(views: ["line", "fill", "thickness", "shadow", "arrow", "font", "highlight",
+        let props = NSStackView(views: ["line", "fill", "thickness", "shadow", "arrow", "font", "counterSize", "highlight",
                                         "obfuscate", "magnify", "crop"].compactMap { groups[$0] })
         props.spacing = 12
         props.setHuggingPriority(.defaultLow, for: .horizontal)
@@ -115,8 +129,17 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         zoomPopup.target = self
         zoomPopup.action = #selector(zoomChosen(_:))
         zoomPopup.controlSize = .small
-        for z in Self.zoomLevels { zoomPopup.addItem(withTitle: "\(Int((z * 100).rounded()))%") }
+        for (i, z) in Self.zoomLevels.enumerated() {
+            zoomPopup.addItem(withTitle: "\(Int((z * 100).rounded()))%")
+            zoomPopup.lastItem?.tag = i
+        }
         zoomPopup.addItem(withTitle: "Fit")
+        zoomPopup.lastItem?.tag = Self.fitZoomTag
+        // One item for pinch/fit zooms that aren't presets. setTitle() on a pop-up would add a
+        // new item for every such zoom (dozens per pinch), and choosing one of those did "Fit".
+        zoomPopup.addItem(withTitle: "")
+        zoomPopup.lastItem?.tag = Self.customZoomTag
+        zoomPopup.lastItem?.isHidden = true
         zoomPopup.toolTip = "Zoom (⌘+ / ⌘- / ⌘0 actual size / ⌘9 fit)"
 
         let spacer = NSView()
@@ -350,6 +373,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         setupPopup(magnifyPopup, Self.magnifications.map { "\($0.formatted())×" }, #selector(magnificationChanged(_:)))
         groups["magnify"] = labeled("Zoom", [magnifyPopup])
 
+        // Counters draw their number in a bold system font sized from the circle, so family,
+        // bold and italic did nothing; a plain diameter control is what actually applies.
+        setupPopup(counterSizePopup, Self.counterSizes.map { "\(Int($0)) pt" }, #selector(counterSizeChanged(_:)))
+        counterSizePopup.toolTip = "Counter diameter"
+        groups["counterSize"] = labeled("Size", [counterSizePopup])
+
         let apply = NSButton(title: "Crop", target: self, action: #selector(applyCrop(_:)))
         apply.bezelStyle = .push
         apply.keyEquivalent = "\r"
@@ -370,6 +399,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
             return CGRect(x: r.minX, y: content.bounds.height - r.maxY, width: r.width, height: r.height)
         }
     }
+
+    /// For the self-checks: the zoom pop-up.
+    var zoomPopupForTesting: NSPopUpButton { zoomPopup }
 
     /// For the self-test: top of the status bar, y-down from the top of the content view.
     func statusBarTop() -> CGFloat? {
@@ -415,8 +447,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     private var relativeZoom: CGFloat { canvas.zoom / actualSizeZoom }
 
     @objc func zoomChosen(_ sender: NSPopUpButton) {
-        let i = sender.indexOfSelectedItem
-        if i < Self.zoomLevels.count { setRelativeZoom(Self.zoomLevels[i]) } else { zoomToFit() }
+        let tag = sender.selectedTag()
+        if Self.zoomLevels.indices.contains(tag) { setRelativeZoom(Self.zoomLevels[tag]) }
+        else if tag == Self.fitZoomTag { zoomToFit() }
+        else { updateStatus() } // the custom item is the current zoom: nothing to do
     }
 
     @objc func zoomIn(_ sender: Any?) {
@@ -433,6 +467,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     // MARK: State → UI
 
     private func documentChanged() {
+        discardConfirmed = false
         canvas.documentChanged()
         updateTitle()
         updateStatus()
@@ -443,7 +478,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         let base = doc.fileURL?.lastPathComponent ?? (doc.title.isEmpty ? "Capture" : doc.title)
         window?.title = base
         window?.subtitle = "\(doc.state.image.width) × \(doc.state.image.height) px"
-        window?.isDocumentEdited = doc.isDirty
+        // The edited dot means "closing would ask", which includes a never-saved capture.
+        window?.isDocumentEdited = hasUnsavedWork
         window?.representedURL = doc.fileURL
     }
 
@@ -462,11 +498,14 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         case .draw: parts.append("Drag to draw · ⇧ constrains · Esc returns to Select")
         }
         statusLabel.stringValue = parts.joined(separator: "   ·   ")
+        let custom = zoomPopup.item(at: zoomPopup.indexOfItem(withTag: Self.customZoomTag))
         if let i = Self.zoomLevels.firstIndex(where: { abs($0 - relativeZoom) < 0.005 }) {
-            zoomPopup.selectItem(at: i)
+            custom?.isHidden = true
+            zoomPopup.selectItem(withTag: i)
         } else {
-            zoomPopup.selectItem(withTitle: "Fit")
-            zoomPopup.setTitle("\(Int((relativeZoom * 100).rounded()))%")
+            custom?.title = "\(Int((relativeZoom * 100).rounded()))%"
+            custom?.isHidden = false
+            zoomPopup.selectItem(withTag: Self.customZoomTag)
         }
     }
 
@@ -491,27 +530,30 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         return canvas.selectedElements.last?.style
     }
 
-    private func updatePropertyBar() {
-        let kind = propertyKind
-        var visible: Set<String> = []
-        if canvas.tool == .crop { visible = ["crop"] }
-        if let kind {
-            switch kind {
-            case .rectangle, .ellipse: visible = ["line", "fill", "thickness", "shadow"]
-            case .line, .freehand: visible = ["line", "thickness", "shadow"]
-            case .arrow: visible = ["line", "thickness", "shadow", "arrow"]
-            case .text: visible = ["line", "fill", "thickness", "font", "shadow"]
-            case .speechBubble: visible = ["line", "fill", "thickness", "font", "shadow"]
-            case .counter: visible = ["line", "fill", "font", "shadow"]
-            case .highlight:
-                visible = ["highlight"]
-                let mode = shownStyle?.highlightMode ?? .text
-                if mode == .text { visible.insert("fill") }
-                if mode == .magnify { visible.insert("magnify") }
-            case .obfuscate: visible = ["obfuscate"]
-            case .image: visible = ["line", "thickness", "shadow"]
-            }
+    /// Which property groups the bar shows for the current tool / selection.
+    var visiblePropertyGroups: Set<String> {
+        if canvas.tool == .crop { return ["crop"] }
+        guard let kind = propertyKind else { return [] }
+        switch kind {
+        case .rectangle, .ellipse: return ["line", "fill", "thickness", "shadow"]
+        case .line, .freehand: return ["line", "thickness", "shadow"]
+        case .arrow: return ["line", "thickness", "shadow", "arrow"]
+        case .text: return ["line", "fill", "thickness", "font", "shadow"]
+        case .speechBubble: return ["line", "fill", "thickness", "font", "shadow"]
+        case .counter: return ["line", "fill", "counterSize", "shadow"]
+        case .highlight:
+            var visible: Set<String> = ["highlight"]
+            let mode = shownStyle?.highlightMode ?? .text
+            if mode == .text { visible.insert("fill") }
+            if mode == .magnify { visible.insert("magnify") }
+            return visible
+        case .obfuscate: return ["obfuscate"]
+        case .image: return ["line", "thickness", "shadow"]
         }
+    }
+
+    private func updatePropertyBar() {
+        let visible = visiblePropertyGroups
         for (name, v) in groups { v.isHidden = !visible.contains(name) }
 
         guard let st = shownStyle else { return }
@@ -533,6 +575,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         strengthPopup.selectItem(at: Self.nearestIndex(Self.strengths, strength))
         strengthPopup.toolTip = st.obfuscateMode == .pixelate ? "Block size (pt)" : "Blur radius (pt)"
         magnifyPopup.selectItem(at: Self.nearestIndex(Self.magnifications, st.magnification))
+        // A selected counter shows its real size (grips can resize it away from the style).
+        let counter = canvas.tool == .select ? canvas.selectedElements.last(where: { $0.kind == .counter }) : nil
+        let diameter = counter.map { $0.frame.width / doc.pixelScale } ?? st.fontSize * 2
+        counterSizePopup.selectItem(at: Self.nearestIndex(Self.counterSizes, diameter))
     }
 
     static func nearestIndex(_ values: [CGFloat], _ v: CGFloat) -> Int {
@@ -547,23 +593,38 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     func canvasZoomChanged() { updateStatus() }
     func canvasSmartZoom() { if abs(relativeZoom - 1) < 0.01 { zoomToFit() } else { setRelativeZoom(1) } }
 
-    func style(for kind: ElementKind) -> ElementStyle { SettingsStore.shared.settings.style(for: kind) }
+    func style(for kind: ElementKind) -> ElementStyle {
+        if let t = toolStylesForTesting { return t[kind] ?? .defaults(for: kind) }
+        return SettingsStore.shared.settings.style(for: kind)
+    }
+
+    private func rememberStyle(_ s: ElementStyle, for kind: ElementKind) {
+        if toolStylesForTesting != nil { toolStylesForTesting?[kind] = s; return }
+        SettingsStore.shared.settings.toolStyles[kind.rawValue] = s
+    }
 
     // MARK: Property changes
 
-    /// A property edit updates the remembered style of the current tool (or of the selected
-    /// elements' kinds) and the selected elements themselves.
+    /// With a drawing tool active, a property edit changes only that tool's remembered style
+    /// (and the shape of that kind just drawn with it, which stays selected), the same as
+    /// Greenshot. It used to restyle any selected shape of another kind too, and rewrite that
+    /// kind's remembered style. With Select, it changes the selected elements and remembers the
+    /// new style for their kinds.
     private func changeStyle(_ change: (inout ElementStyle) -> Void) {
         guard !isUpdatingControls else { return }
-        var kinds: Set<ElementKind> = []
-        if let k = canvas.tool.kind { kinds.insert(k) }
-        for e in canvas.selectedElements { kinds.insert(e.kind) }
-        for k in kinds {
+        if let k = canvas.tool.kind {
             var s = style(for: k)
             change(&s)
-            SettingsStore.shared.settings.toolStyles[k.rawValue] = s
+            rememberStyle(s, for: k)
+            canvas.applyStyleToSelection(only: k, change)
+        } else {
+            for k in Set(canvas.selectedElements.map(\.kind)) {
+                var s = style(for: k)
+                change(&s)
+                rememberStyle(s, for: k)
+            }
+            canvas.applyStyleToSelection(change)
         }
-        canvas.applyStyleToSelection(change)
         updatePropertyBar()
     }
 
@@ -604,6 +665,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     @objc func magnificationChanged(_ sender: NSPopUpButton) {
         let v = Self.magnifications[sender.indexOfSelectedItem]; changeStyle { $0.magnification = v }
     }
+    @objc func counterSizeChanged(_ sender: NSPopUpButton) {
+        let d = Self.counterSizes[sender.indexOfSelectedItem]; changeStyle { $0.fontSize = d / 2 }
+    }
 
     @objc func toolClicked(_ sender: NSButton) {
         if let t = toolButtons.first(where: { $0.1 === sender })?.0 { canvas.tool = t }
@@ -621,18 +685,29 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         return renderer.flatten(doc.state)
     }
 
-    @objc func saveDocument(_ sender: Any?) {
-        guard let img = flattened() else { return }
+    @objc func saveDocument(_ sender: Any?) { save() }
+
+    /// Saves to the document's file, or a new one from the filename pattern. True on success.
+    @discardableResult
+    private func save() -> Bool {
+        if let fake = saveActionForTesting {
+            let ok = fake()
+            if ok { doc.markSaved(); updateTitle() }
+            return ok
+        }
+        guard let img = flattened() else { return false }
         do {
             if let url = doc.fileURL {
                 try Output.write(img, to: url)
             } else {
                 doc.fileURL = try Output.saveWithPattern(img, title: doc.title, date: doc.captureDate)
             }
-            doc.markSaved()
+            doc.markSaved() // also marks it exported (wasExported)
             updateTitle()
+            return true
         } catch {
             Output.showError("Couldn't save the image", error)
+            return false
         }
     }
 
@@ -649,6 +724,9 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     @objc func copyImage(_ sender: Any?) {
         guard let img = flattened() else { return }
         Output.copyToClipboard(img, pixelScale: doc.pixelScale)
+        // The picture now exists outside the editor, so closing needn't ask (until the next edit).
+        doc.wasExported = true
+        updateTitle()
         flashStatus("Copied the image to the clipboard")
     }
 
@@ -661,11 +739,13 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
 
     @objc func editorUndo(_ sender: Any?) {
         if let tv = canvas.activeTextView { tv.undoManager?.undo(); return }
+        guard !canvas.isDragging else { return }
         doc.undo()
     }
 
     @objc func editorRedo(_ sender: Any?) {
         if let tv = canvas.activeTextView { tv.undoManager?.redo(); return }
+        guard !canvas.isDragging else { return }
         doc.redo()
     }
 
@@ -691,6 +771,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     }
 
     @objc func paste(_ sender: Any?) {
+        guard !canvas.isDragging else { return }
         let pb = NSPasteboard.general
         if pb.changeCount == ElementClipboard.changeCount, !ElementClipboard.elements.isEmpty {
             let offset = 10 * doc.pixelScale
@@ -748,9 +829,11 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     /// Whole-picture effects bake the annotations into the pixels first, so the result looks
     /// exactly like what you saw (undo brings the editable annotations back).
     private func applyEffect(_ f: (CGImage) -> CGImage?) {
-        guard let flat = flattened(), let out = f(flat) else { NSSound.beep(); return }
+        guard !canvas.isDragging, let flat = flattened(), let out = f(flat) else { NSSound.beep(); return }
         canvas.setSelection([])
         doc.replaceImage(out)
+        // A pending crop rectangle refers to the old geometry (a rotated square keeps its size).
+        canvas.setCropRect(nil)
     }
 
     @objc func effectShadow(_ sender: Any?) { applyEffect { Effects.dropShadow($0, pixelScale: doc.pixelScale) } }
@@ -758,10 +841,21 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     @objc func effectTornBottom(_ sender: Any?) {
         applyEffect { Effects.tornEdges($0, pixelScale: doc.pixelScale, sides: .bottom) }
     }
+    /// "Current line colour and thickness": what the property bar shows for the active tool or
+    /// selection; whichever of the two it doesn't show comes from the Rectangle tool.
+    func borderStyle() -> (color: RGBA, width: CGFloat) {
+        let rect = style(for: .rectangle)
+        guard let st = shownStyle else { return (rect.stroke, rect.lineWidth) }
+        let visible = visiblePropertyGroups
+        let color = visible.contains("line") ? st.stroke : rect.stroke
+        let width = visible.contains("thickness") && st.lineWidth > 0 ? st.lineWidth : rect.lineWidth
+        return (color, width)
+    }
+
     @objc func effectBorder(_ sender: Any?) {
-        let st = style(for: .rectangle)
-        let w = max(1, Int((st.lineWidth * doc.pixelScale).rounded()))
-        applyEffect { Effects.border($0, width: w, color: st.stroke) }
+        let st = borderStyle()
+        let w = max(1, Int((st.width * doc.pixelScale).rounded()))
+        applyEffect { Effects.border($0, width: w, color: st.color) }
     }
     @objc func effectGrayscale(_ sender: Any?) { applyEffect { Effects.grayscale($0) } }
     @objc func effectInvert(_ sender: Any?) { applyEffect { Effects.invert($0) } }
@@ -805,7 +899,20 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
 
     // MARK: Menu validation
 
+    /// Commands that change the document. Their shortcuts still arrive while the mouse button
+    /// is held, and running them under a drag tangled the undo history.
+    private static let documentChangingActions: Set<Selector> = [
+        #selector(editorUndo(_:)), #selector(editorRedo(_:)), #selector(cut(_:)), #selector(paste(_:)),
+        #selector(delete(_:)), #selector(duplicateSelection(_:)), #selector(bringToFront(_:)),
+        #selector(bringForward(_:)), #selector(sendBackward(_:)), #selector(sendToBack(_:)),
+        #selector(applyCrop(_:)), #selector(autoCrop(_:)), #selector(insertImageFromFile(_:)),
+        #selector(effectShadow(_:)), #selector(effectTornAll(_:)), #selector(effectTornBottom(_:)),
+        #selector(effectBorder(_:)), #selector(effectGrayscale(_:)), #selector(effectInvert(_:)),
+        #selector(effectRotateCW(_:)), #selector(effectRotateCCW(_:)), #selector(effectResize(_:)),
+    ]
+
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if canvas.isDragging, let a = item.action, Self.documentChangingActions.contains(a) { return false }
         switch item.action {
         case #selector(editorUndo(_:)): return canvas.activeTextView != nil || doc.canUndo
         case #selector(editorRedo(_:)): return canvas.activeTextView != nil || doc.canRedo
@@ -820,29 +927,60 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
 
     // MARK: Closing
 
+    /// Closing would lose something: the capture was never saved or copied anywhere, or it
+    /// changed since it last was (doc.hasUnexportedChanges), or text is still being typed.
+    /// After "Don't Save" it's false until the next edit. Used by the close and quit prompts.
+    var hasUnsavedWork: Bool {
+        guard !discardConfirmed else { return false }
+        return doc.hasUnexportedChanges || canvas.isEditingText
+    }
+
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         canvas.endTextEdit()
-        guard doc.isDirty else { return true }
+        guard hasUnsavedWork else { return true }
+        askToSave { [weak self] ok in
+            guard ok, let self else { return }
+            self.discardConfirmed = true
+            sender.close()
+        }
+        return false
+    }
+
+    /// For Quit: the same question as closing, but the window stays open either way; the app
+    /// closes it when it terminates. done(true) = go ahead (saved, or Don't Save), false = Cancel.
+    func confirmDiscardForQuit(_ done: @escaping (Bool) -> Void) {
+        canvas.endTextEdit()
+        guard hasUnsavedWork else { done(true); return }
+        if savePromptResponder == nil { // the self-checks never put a window on screen
+            showWindow(nil)
+            window?.makeKeyAndOrderFront(nil)
+        }
+        askToSave(done)
+    }
+
+    /// Save / Cancel / Don't Save. Calls back true when it's fine to discard the window.
+    private func askToSave(_ done: @escaping (Bool) -> Void) {
         let alert = NSAlert()
         alert.messageText = "Save changes to this capture?"
         alert.informativeText = "If you don't save, the capture and your annotations are lost."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Don't Save")
-        alert.beginSheetModal(for: sender) { [weak self] resp in
-            guard let self else { return }
+        let handle: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
+            guard let self else { done(false); return }
             switch resp {
             case .alertFirstButtonReturn:
-                self.saveDocument(nil)
-                if !self.doc.isDirty { sender.close() }
+                done(self.save() && !self.doc.hasUnexportedChanges)
             case .alertThirdButtonReturn:
-                self.doc.markSaved()
-                sender.close()
+                self.discardConfirmed = true
+                done(true)
             default:
-                break
+                done(false)
             }
         }
-        return false
+        if let responder = savePromptResponder { handle(responder(alert)); return }
+        guard let window, window.attachedSheet == nil else { done(false); return }
+        alert.beginSheetModal(for: window, completionHandler: handle)
     }
 
     func windowWillClose(_ notification: Notification) {
