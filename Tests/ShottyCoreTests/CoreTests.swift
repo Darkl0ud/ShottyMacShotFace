@@ -753,3 +753,66 @@ func tempURL(_ name: String) -> URL {
         }
     }
 }
+
+// MARK: Review round 3 (editor)
+
+struct Round3EditorTests {
+    func box(_ kind: ElementKind, _ text: String, _ frame: CGRect, s: CGFloat = 2) -> Element {
+        var e = Element(kind: kind, frame: frame)
+        e.text = text
+        return Renderer.fittingText(e, pixelScale: s)
+    }
+
+    func fits(_ e: Element, _ s: CGFloat = 2) -> Bool {
+        let inner = Renderer.textRect(for: e, pixelScale: s)
+        return inner.height + 0.5 >= Renderer.textHeight(e.text, style: e.style, pixelScale: s, width: inner.width,
+                                                         center: e.kind == .speechBubble)
+    }
+
+    @Test func pixelScaleFromDPI() {
+        #expect(ImageExporter.pixelScale(dpi: 72) == 1)
+        #expect(ImageExporter.pixelScale(dpi: 139.9) == 1)
+        #expect(ImageExporter.pixelScale(dpi: 144) == 2)
+        #expect(ImageExporter.pixelScale(dpi: 300) == 2)
+    }
+
+    /// CORE_EDITOR-R3-1: every event works from the drag-start element, so the growth goes away again.
+    @Test func gripResizeIsReversible() {
+        let start = box(.text, "A sentence that is long enough to need two lines", CGRect(x: 100, y: 100, width: 480, height: 40))
+        let grip = Grip.right.position(in: start.frame)
+        let narrow = Renderer.resizedFittingText(start, .grip(.right), to: CGPoint(x: 130, y: grip.y), pixelScale: 2)
+        #expect(narrow.frame.height > start.frame.height * 2 && fits(narrow))
+        let back = Renderer.resizedFittingText(start, .grip(.right), to: grip, pixelScale: 2)
+        #expect(back.frame == start.frame)
+    }
+
+    /// CORE_EDITOR-R3-1: a top grip squash grows the box upwards, keeping its bottom edge.
+    @Test func topGripGrowsUpwards() {
+        let start = box(.text, "Hello", CGRect(x: 100, y: 100, width: 480, height: 86))
+        let e = Renderer.resizedFittingText(start, .grip(.top), to: CGPoint(x: 340, y: start.frame.maxY - 4), pixelScale: 2)
+        #expect(e.frame.maxY == start.frame.maxY && e.frame.height > 4 && fits(e))
+        let side = Renderer.resizedFittingText(start, .grip(.bottom), to: CGPoint(x: 340, y: 104), pixelScale: 2)
+        #expect(side.frame.minY == start.frame.minY && fits(side))
+    }
+
+    /// CORE_EDITOR-R3-2: pulling a bubble's bottom up past its text leaves the tip where it was.
+    @Test func bubbleTipDoesNotDrift() {
+        var start = box(.speechBubble, "one\ntwo\nthree", CGRect(x: 200, y: 100, width: 400, height: 160))
+        start.points = [CGPoint(x: 300, y: start.frame.maxY + 100)]
+        let e = Renderer.resizedFittingText(start, .grip(.bottom), to: CGPoint(x: 400, y: start.frame.maxY - 60), pixelScale: 2)
+        #expect(e.points[0] == start.points[0] && fits(e))
+        // Narrowing (the body grows down past its old bottom) still carries the tail along.
+        let n = Renderer.resizedFittingText(start, .grip(.right), to: CGPoint(x: 260, y: 180), pixelScale: 2)
+        #expect(n.frame.maxY > start.frame.maxY && n.points[0].y - n.frame.maxY == start.points[0].y - start.frame.maxY)
+    }
+
+    /// CORE_EDITOR-R3-3: a frame squashed under its own inset still grows enough for every line.
+    @Test func squashedFrameFitsAllLines() {
+        for kind in [ElementKind.text, .speechBubble] {
+            var e = Element(kind: kind, frame: CGRect(x: 100, y: 100, width: 400, height: 1))
+            e.text = "one\ntwo\nthree"
+            e.frame = Renderer.frameFittingText(e, pixelScale: 2)
+            #expect(fits(e), "\(kind)")
+        }
+    }
+}

@@ -30,13 +30,18 @@ enum Output {
 
     /// The clipboard image and its pixels-per-point. Our own copies carry a TIFF sized in points (and
     /// so do most Mac apps'), which tells a Retina image apart; the PNG alone always reads as 1x.
+    /// The TIFF's resolution goes through the same rule as Open Image from File, so an image opens
+    /// at the same size either way.
     static func imageFromClipboardWithScale(_ pb: NSPasteboard = .general) -> (image: CGImage, scale: CGFloat)? {
         guard let ns = NSImage(pasteboard: pb) else { return nil }
         var r = CGRect(origin: .zero, size: ns.size)
         guard let img = ns.cgImage(forProposedRect: &r, context: nil, hints: nil) else { return nil }
         var scale: CGFloat = 1
-        if let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff), rep.size.width > 0 {
-            scale = min(3, max(1, (CGFloat(rep.pixelsWide) / rep.size.width).rounded()))
+        // Only when the TIFF is this very picture: an app may put a full-size PNG next to a smaller
+        // TIFF, whose resolution says nothing about the PNG.
+        if let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff),
+           rep.size.width > 0, rep.pixelsWide == img.width {
+            scale = ImageExporter.pixelScale(dpi: 72 * CGFloat(rep.pixelsWide) / rep.size.width)
         }
         return (img, scale)
     }

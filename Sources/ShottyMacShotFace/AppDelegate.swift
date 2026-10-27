@@ -21,6 +21,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
     var presentEditor: ((EditorDocument) -> Void)?
     var beep: () -> Void = { NSSound.beep() }
+    /// More seams, so the self-test can deliver a capture without the real clipboard, the capture
+    /// folder or a menu popping up on screen.
+    var clipboard: NSPasteboard = .general
+    var saveWithPattern: (CaptureResult) throws -> URL = { r in
+        try Output.saveWithPattern(r.image, title: r.title, date: r.date)
+    }
+    var presentDestinationMenu: ((NSMenu) -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.applicationIconImage = Self.makeAppIcon()
@@ -245,13 +252,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     /// Not while another capture runs, nor during an app-modal panel or alert: AppKit gives a
     /// non-modal window (the overlay) no mouse input then, so it couldn't be used or dismissed.
-    private(set) var isReviewingQuit = false
+    /// Settable only so the self-test can stand in for a Quit review without real editors.
+    var isReviewingQuit = false
     private var pendingDestinationMenu: NSMenu?
     var canStartCapture: Bool { !busy && overlay == nil && NSApp.modalWindow == nil && !isReviewingQuit }
 
     func capture(_ action: HotkeyAction) {
         guard canStartCapture else {
-            if NSApp.modalWindow != nil { beep() }
+            // A busy capture or an open overlay is visible; a modal panel or the Quit sheets may not
+            // be (sheets don't count as modalWindow), so say no out loud and show what's waiting.
+            if NSApp.modalWindow != nil || isReviewingQuit { beep() }
+            if isReviewingQuit { showPendingQuitSheet() }
             return
         }
         busy = true
@@ -283,6 +294,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 Output.showError("Capture failed", error)
             }
         }
+    }
+
+    /// The editor whose Save / Don't Save sheet the Quit review is waiting on, brought to the front.
+    private func showPendingQuitSheet() {
+        guard let w = editors.lazy.compactMap(\.window).first(where: { $0.attachedSheet != nil }) else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
     }
 
     enum LastRegionPlan: Equatable { case select, capture(CGRect) }
@@ -344,43 +362,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     func deliver(_ r: CaptureResult) {
         Output.playShutter()
-        var dests = store.settings.destinations
-        if dests.isEmpty { dests = [.editor] }
-        if dests.contains(.ask) {
-            showDestinationMenu(r)
-        } else {
-            run(dests, r)
-        }
+        deliver(r, to: store.settings.destinations)
     }
 
-    func run(_ dests: [Destination], _ r: CaptureResult) {
+    /// What happens to a capture: `immediate` runs right away; `showsMenu` then asks about the rest.
+    struct DeliveryPlan: Equatable {
+        var immediate: [Destination]
+        var showsMenu: Bool
+    }
+
+    /// The ticked destinations are a combination (README), so Ask doesn't cancel the others. The
+    /// quick, silent ones (clipboard, save with pattern) still happen; the ones that open a window
+    /// (editor, Save As) are left to the menu, which offers them anyway, so the user isn't handed
+    /// an editor or a save panel at the same moment as a menu asking what to do.
+    static func planDelivery(_ dests: [Destination]) -> DeliveryPlan {
+        if dests.isEmpty { return DeliveryPlan(immediate: [.editor], showsMenu: false) }
+        guard dests.contains(.ask) else { return DeliveryPlan(immediate: dests, showsMenu: false) }
+        return DeliveryPlan(immediate: dests.filter { $0 == .clipboard || $0 == .file }, showsMenu: true)
+    }
+
+    func deliver(_ r: CaptureResult, to dests: [Destination]) {
+        let plan = Self.planDelivery(dests)
+        let done = run(plan.immediate, r)
+        if plan.showsMenu { showDestinationMenu(r, after: done) }
+    }
+
+    /// What has already happened to a capture, so a later step (a choice from the Ask menu)
+    /// doesn't repeat it and an editor opened then knows the capture exists elsewhere (C1/C4).
+    struct DeliveryState {
+        var done: [Destination] = []
         var savedURL: URL?
-        var exported = false // the capture now exists outside the editor (C1)
+        var exported = false
+    }
+
+    /// Runs `dests` on top of `prior`; returns the state after the synchronous ones (Save As
+    /// answers later and only feeds the editor).
+    @discardableResult
+    func run(_ dests: [Destination], _ r: CaptureResult, after prior: DeliveryState = DeliveryState()) -> DeliveryState {
+        var state = prior
         for d in dests {
             switch d {
             case .clipboard:
-                Output.copyToClipboard(r.image, pixelScale: r.scale)
-                exported = true
+                Output.copyToClipboard(r.image, pixelScale: r.scale, to: clipboard)
+                state.exported = true
             case .file:
-                do { savedURL = try Output.saveWithPattern(r.image, title: r.title, date: r.date); exported = true }
+                do { state.savedURL = try saveWithPattern(r); state.exported = true }
                 catch { Output.showError("Couldn't save the capture", error) }
             default:
                 break
             }
+            state.done.append(d)
         }
         let wantsEditor = dests.contains(.editor)
         // Editor last, so a file saved above becomes the editor's file (⌘S updates it). Save As is
         // asynchronous, so the editor waits for its answer.
         guard dests.contains(.fileAs) else {
             if wantsEditor { openEditor(image: r.image, scale: r.scale, title: r.title, date: r.date,
-                                        fileURL: savedURL, wasExported: exported) }
-            return
+                                        fileURL: state.savedURL, wasExported: state.exported) }
+            return state
         }
+        let sync = state
         presentSaveAs(r) { [weak self] url in
             guard let self, wantsEditor else { return }
             self.openEditor(image: r.image, scale: r.scale, title: r.title, date: r.date,
-                            fileURL: savedURL ?? url, wasExported: exported || url != nil)
+                            fileURL: sync.savedURL ?? url, wasExported: sync.exported || url != nil)
         }
+        return state
     }
 
     /// What one "Ask each time" menu item does. The capture travels with the items, so it's freed
@@ -388,27 +435,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     final class DestinationChoice: NSObject {
         let destination: Destination?
         let result: CaptureResult
-        init(_ d: Destination?, _ r: CaptureResult) { destination = d; result = r }
+        let prior: DeliveryState
+        init(_ d: Destination?, _ r: CaptureResult, prior: DeliveryState = DeliveryState()) {
+            destination = d; result = r; self.prior = prior
+        }
     }
 
-    func makeDestinationMenu(_ r: CaptureResult) -> NSMenu {
+    /// Leaves out what already happened (a second pattern save would make a second file).
+    func makeDestinationMenu(_ r: CaptureResult, after prior: DeliveryState = DeliveryState()) -> NSMenu {
         let menu = NSMenu()
-        for d in Destination.allCases where d != .ask {
+        for d in Destination.allCases where d != .ask && !prior.done.contains(d) {
             let i = NSMenuItem(title: d.title, action: #selector(destinationChosen(_:)), keyEquivalent: "")
             i.target = self
-            i.representedObject = DestinationChoice(d, r)
+            i.representedObject = DestinationChoice(d, r, prior: prior)
             menu.addItem(i)
         }
         menu.addItem(.separator())
-        let cancel = NSMenuItem(title: "Discard", action: #selector(destinationChosen(_:)), keyEquivalent: "")
+        let cancel = NSMenuItem(title: prior.exported ? "Done" : "Discard", action: #selector(destinationChosen(_:)),
+                                keyEquivalent: "")
         cancel.target = self
-        cancel.representedObject = DestinationChoice(nil, r)
+        cancel.representedObject = DestinationChoice(nil, r, prior: prior)
         menu.addItem(cancel)
         return menu
     }
 
-    private func showDestinationMenu(_ r: CaptureResult) {
-        let menu = makeDestinationMenu(r)
+    private func showDestinationMenu(_ r: CaptureResult, after prior: DeliveryState) {
+        let menu = makeDestinationMenu(r, after: prior)
+        if let presentDestinationMenu { presentDestinationMenu(menu); return }
         NSApp.activate(ignoringOtherApps: true)
         // popUp runs a nested event loop; started from inside the capture Task it would hold the
         // main actor (and busy) for as long as the menu is open. Run it on its own run-loop turn.
@@ -425,7 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     @objc func destinationChosen(_ sender: NSMenuItem) {
         guard let choice = sender.representedObject as? DestinationChoice, let d = choice.destination else { return }
-        run([d], choice.result)
+        run([d], choice.result, after: choice.prior)
     }
 
     // MARK: Editors

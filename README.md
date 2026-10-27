@@ -53,6 +53,8 @@ The hotkeys can be changed in Preferences. The defaults avoid macOS's own ⌘⇧
 ### After capture (pick any combination)
 Open in the image editor · copy to clipboard · save with the filename pattern · Save As… · ask each time
 (a pop-up menu).
+With Ask each time, copying and saving with the pattern still happen straight away; the menu then offers what's
+left (editor, Save As…), so Editor and Save As ticked alongside it are chosen from the menu.
 
 ### Image editor
 | Tool | Key | |

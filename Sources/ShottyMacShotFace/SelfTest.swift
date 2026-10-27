@@ -263,6 +263,9 @@ final class SelfTest: NSObject, NSApplicationDelegate {
         // 4z. Fixer A's editor checks (contract C3).
         EditorSelfChecks.run(check: { self.check($0, $1) }, note: { self.note($0) })
         Round2SelfChecks.run(check: { self.check($0, $1) })
+        // Review round 3: fixer A's editor checks and fixer B's app checks (contract C2).
+        Round3EditorChecks.run(check: { self.check($0, $1) }, note: { self.note($0) })
+        Round3AppChecks.run(check: { self.check($0, $1) }, note: { self.note($0) })
 
         // 4a. Opening size: a wide, short capture (2313×233 px @2x, like a strip of text) should give
         // a window about as wide as the picture plus the side palette, and tall enough for every tool.

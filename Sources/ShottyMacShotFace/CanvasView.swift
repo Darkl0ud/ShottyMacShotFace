@@ -63,12 +63,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
         case none
         case creating(UUID, start: CGPoint)
         case moving(start: CGPoint, originals: [UUID: Element])
-        case resizing(UUID, Handle)
+        /// `original` is the element at mouse-down: every event resizes from it (see mouseDragged).
+        case resizing(UUID, Handle, original: Element)
         case rubberBand(start: CGPoint, current: CGPoint)
         case cropping(start: CGPoint)
     }
     private var drag: Drag = .none
     private var textView: NSTextView?
+    /// The typing history of the current text edit only (see undoManager(for:)).
+    private var textUndo: UndoManager?
     private(set) var editingID: UUID?
     /// A text box created by the current click/drag: its creation stays one open live change
     /// until the typing ends, so create + type is one undo step and an empty box leaves no trace.
@@ -187,7 +190,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let id: UUID
         switch drag {
         case .creating(let i, _): id = i
-        case .resizing(let i, _): id = i
+        case .resizing(let i, _, _): id = i
         case .moving(_, let originals) where originals.count == 1: id = originals.keys.first!
         default: return nil
         }
@@ -208,7 +211,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let ids: Set<UUID>
         switch drag {
         case .creating(let i, _): ids = [i]
-        case .resizing(let i, _): ids = [i]
+        case .resizing(let i, _, _): ids = [i]
         case .moving(_, let originals): ids = Set(originals.keys)
         default: return nil
         }
@@ -364,7 +367,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
               let h = e.handles().first(where: { viewPoint($0.1).distance(to: viewPoint(p)) <= 7 })?.0
         else { return false }
         doc.beginLiveChange()
-        drag = .resizing(id, h)
+        drag = .resizing(id, h, original: e)
         return true
     }
 
@@ -424,17 +427,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     if var e = originals[st.elements[i].id] { e.move(by: d); st.elements[i] = e }
                 }
             }
-        case .resizing(let id, let h):
+        case .resizing(let id, let h, let original):
             var target = p
-            if shift, case .point(let idx) = h, let e = doc.element(id), e.points.count == 2 {
-                target = Geometry.snap45(from: e.points[1 - idx], to: p)
+            if shift, case .point(let idx) = h, original.points.count == 2 {
+                target = Geometry.snap45(from: original.points[1 - idx], to: p)
             }
             let s = doc.pixelScale
             doc.mutateLive { st in
                 guard let i = st.elements.firstIndex(where: { $0.id == id }) else { return }
-                st.elements[i].drag(h, to: target)
-                // Narrowing a text box wraps its text onto more lines: grow it so none is hidden.
-                if st.elements[i].kind.hasText { st.elements[i] = Renderer.fittingText(st.elements[i], pixelScale: s) }
+                // From the mouse-down element, never the previous event's frame: narrowing grows a
+                // text box so no text is hidden, and that growth must go away again on widening.
+                st.elements[i] = Renderer.resizedFittingText(original, h, to: target, pixelScale: s)
             }
         case .rubberBand(let start, _):
             drag = .rubberBand(start: start, current: p)
@@ -495,20 +498,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
         case .line, .arrow: tooSmall = e.points[0].distance(to: e.points[1]) < 3
         case .freehand: tooSmall = false
         case .text, .speechBubble:
-            // A click, or a drag too small to type in (thresholds in points), gets a sensibly sized box.
-            if e.frame.width < (e.kind == .text ? 40 : 60) * s || e.frame.height < 12 * s {
-                // A plain click gets a sensibly sized box.
-                doc.mutateLive { st in
-                    guard let i = st.elements.firstIndex(where: { $0.id == id }) else { return }
-                    let o = st.elements[i].frame.origin
-                    if e.kind == .text {
-                        st.elements[i].frame = CGRect(x: o.x, y: o.y, width: 240 * s, height: e.style.fontSize * 2.4 * s)
-                    } else {
-                        st.elements[i].frame = CGRect(x: o.x, y: o.y, width: 200 * s, height: 80 * s)
-                        st.elements[i].points = [CGPoint(x: o.x + 50 * s, y: o.y + 130 * s)]
-                    }
-                }
-            }
+            let fixed = Self.usableTextFrame(e, pixelScale: s)
+            if fixed != e { doc.mutateLive { st in if let i = st.elements.firstIndex(where: { $0.id == id }) { st.elements[i] = fixed } } }
         default: tooSmall = e.frame.width < 3 || e.frame.height < 3
         }
         if tooSmall {
@@ -523,6 +514,27 @@ final class CanvasView: NSView, NSTextViewDelegate {
             return
         }
         doc.endLiveChange()
+    }
+
+    /// A text box or bubble just drawn, made big enough to type in (thresholds in points). Only the
+    /// side that is too small takes its default, so a long thin caption drag keeps its width and a
+    /// tall narrow bubble its height. A click (both sides small) gets the whole default box.
+    static func usableTextFrame(_ e: Element, pixelScale s: CGFloat) -> Element {
+        let isText = e.kind == .text
+        let narrow = e.frame.width < (isText ? 40 : 60) * s, flat = e.frame.height < 12 * s
+        guard narrow || flat else { return e }
+        var out = e
+        let o = e.frame.origin
+        let w = narrow ? (isText ? 240 : 200) * s : e.frame.width
+        let h = flat ? (isText ? e.style.fontSize * 2.4 : 80) * s : e.frame.height
+        out.frame = CGRect(x: o.x, y: o.y, width: w, height: h)
+        if !isText {
+            // The tail goes below the new body, placed the way a drag places it (a click keeps
+            // the old fixed default).
+            out.points = [narrow && flat ? CGPoint(x: o.x + 50 * s, y: o.y + 130 * s)
+                          : CGPoint(x: o.x + w * 0.25, y: o.y + h + max(20 * s, h * 0.5))]
+        }
+        return out
     }
 
     // MARK: Trackpad zoom
@@ -644,7 +656,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     /// Applies a style tweak to the selected elements (only those whose kind matches)
     /// as one undo step. Text boxes grow to fit a bigger font; counters take their size from it.
-    func applyStyleToSelection(matching kinds: (ElementKind) -> Bool = { _ in true }, _ change: (inout ElementStyle) -> Void) {
+    /// `sizesCounters`: the change comes from the counter Size control, so counters take the size
+    /// even when their style already has it (a grip resize changes the frame, not the style).
+    func applyStyleToSelection(matching kinds: (ElementKind) -> Bool = { _ in true }, sizesCounters: Bool = false,
+                               _ change: (inout ElementStyle) -> Void) {
         let ids = selection.filter { id in doc.element(id).map { kinds($0.kind) } ?? false }
         guard !ids.isEmpty else { return }
         let s = doc.pixelScale
@@ -653,7 +668,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 var e = st.elements[i]
                 let before = e.style
                 change(&e.style)
-                if e.kind == .counter, e.style.fontSize != before.fontSize {
+                if e.kind == .counter, e.style.fontSize != before.fontSize || sizesCounters {
                     let d = e.style.fontSize * 2 * s
                     e.frame = CGRect(x: e.frame.midX - d / 2, y: e.frame.midY - d / 2, width: d, height: d)
                 }
@@ -674,6 +689,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
         guard let e = doc.element(id), e.kind.hasText else { return }
         endTextEdit()
         editingID = id
+        // Its own history per edit: on the window's shared manager, ⌘Z while typing went on to
+        // undo typing in earlier, already committed boxes, and kept every old text view alive.
+        textUndo = UndoManager()
         let tv = NSTextView(frame: viewRect(textRect(e)))
         tv.string = e.text
         tv.isRichText = false
@@ -726,6 +744,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
         editingID = nil
         textView = nil
         tv.removeFromSuperview()
+        textUndo?.removeAllActions()
+        textUndo = nil
         if commit, let e = doc.element(id) {
             if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, e.kind == .text {
                 // A new box left empty leaves no trace in the history; emptying an old one deletes it.
@@ -758,6 +778,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     var isEditingText: Bool { editingID != nil }
     var activeTextView: NSTextView? { textView }
+    /// What ⌘Z / ⇧⌘Z act on while typing.
+    var activeTextUndoManager: UndoManager? { textView == nil ? nil : textUndo }
+
+    func undoManager(for view: NSTextView) -> UndoManager? { textUndo }
 
     func textView(_ textView: NSTextView, doCommandBy sel: Selector) -> Bool {
         // Esc or ⌘↩ finishes the text; plain Return makes a new line.

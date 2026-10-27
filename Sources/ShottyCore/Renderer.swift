@@ -256,10 +256,38 @@ public final class Renderer {
         guard e.kind.hasText, !e.text.isEmpty else { return e.frame }
         let inner = textRect(for: e, pixelScale: s)
         let need = textHeight(e.text, style: e.style, pixelScale: s, width: inner.width, center: e.kind == .speechBubble)
-        let pad = e.frame.height - inner.height // 4 pt for text boxes, 12 pt for bubbles
+        // The full vertical inset (4 pt for text boxes, 12 pt for bubbles), not the one textRect
+        // clamps on a squashed frame: once grown, the box gets the full inset back, and padding
+        // measured from the squashed frame left the last line clipped.
+        let pad = 2 * (e.kind == .speechBubble ? 6 : 2) * s
         var f = e.frame
         f.size.height = max(f.height, need + pad + 1)
         return f
+    }
+
+    /// A grip drag of a text box or bubble, worked out from the element as it was when the drag
+    /// began, then grown to fit its text. Each mouse event starts again from `start` rather than
+    /// from the previous event's (already grown) frame: so widening back undoes the growth that
+    /// narrowing caused, and a bubble's tail can't creep further on every event.
+    public static func resizedFittingText(_ start: Element, _ handle: Handle, to p: CGPoint, pixelScale s: CGFloat) -> Element {
+        var e = start
+        e.drag(handle, to: p)
+        guard e.kind.hasText, case .grip(let g) = handle else { return e }
+        let dragged = e.frame
+        var f = frameFittingText(e, pixelScale: s)
+        // Grow away from the edge the pointer holds. With a top grip the fixed edge is the bottom,
+        // so the box grows upwards instead of the bottom being pushed down along with the pointer.
+        let fixedY: CGFloat? = [.topLeft, .top, .topRight].contains(g) ? start.frame.maxY
+            : [.bottomLeft, .bottom, .bottomRight].contains(g) ? start.frame.minY : nil
+        if let y = fixedY, abs(dragged.maxY - y) < 0.001 { f.origin.y = dragged.maxY - f.height }
+        e.frame = f
+        // The tail keeps pointing where it did; only the fit pushing the body past both its start
+        // bottom and where the pointer put it moves the tip, so the body can't swallow its own tail.
+        if e.kind == .speechBubble, let tip = start.points.first, tip.y >= start.frame.maxY {
+            let push = f.maxY - max(start.frame.maxY, dragged.maxY)
+            if push > 0 { e.points[0] = CGPoint(x: tip.x, y: tip.y + push) }
+        }
+        return e
     }
 
     private func drawText(_ text: String, in rect: CGRect, style st: ElementStyle, ctx: CGContext, center: Bool) {

@@ -110,7 +110,13 @@ public enum ImageExporter {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let img = orientedImage(src) else { return nil }
         let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
         let dpi = (props?[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue ?? 72
-        return (img, dpi >= 140 ? 2 : 1)
+        return (img, pixelScale(dpi: CGFloat(dpi)))
+    }
+
+    /// One rule for every image source (files and the clipboard), so a picture means the same
+    /// size wherever it comes from. 144 dpi is Retina; 140 leaves room for rounding in the file.
+    public static func pixelScale(dpi: CGFloat) -> CGFloat {
+        dpi >= 140 ? 2 : 1
     }
 
     static func orientedImage(_ src: CGImageSource) -> CGImage? {

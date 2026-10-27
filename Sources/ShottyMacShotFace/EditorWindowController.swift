@@ -55,6 +55,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     var savePromptResponder: ((NSAlert) -> NSApplication.ModalResponse)?
     var saveActionForTesting: (() -> Bool)?
     var toolStylesForTesting: [ElementKind: ElementStyle]?
+    /// Paste reads this instead of the real clipboard in the self-test.
+    var pasteboardForTesting: NSPasteboard?
 
     static let thicknesses: [CGFloat] = [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20]
     static let fontSizes: [CGFloat] = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64, 72, 96]
@@ -612,7 +614,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     /// new style for their kinds.
     /// `kinds` limits which element kinds a control affects: font controls only text, the counter
     /// Size only counters (both live in fontSize, so a mixed selection would otherwise cross over).
-    private func changeStyle(kinds: @escaping (ElementKind) -> Bool = { _ in true },
+    private func changeStyle(kinds: @escaping (ElementKind) -> Bool = { _ in true }, sizesCounters: Bool = false,
                              _ change: (inout ElementStyle) -> Void) {
         guard !isUpdatingControls else { return }
         if let k = canvas.tool.kind {
@@ -620,14 +622,14 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
             var s = style(for: k)
             change(&s)
             rememberStyle(s, for: k)
-            canvas.applyStyleToSelection(matching: { $0 == k }, change)
+            canvas.applyStyleToSelection(matching: { $0 == k }, sizesCounters: sizesCounters, change)
         } else {
             for k in Set(canvas.selectedElements.map(\.kind)) where kinds(k) {
                 var s = style(for: k)
                 change(&s)
                 rememberStyle(s, for: k)
             }
-            canvas.applyStyleToSelection(matching: kinds, change)
+            canvas.applyStyleToSelection(matching: kinds, sizesCounters: sizesCounters, change)
         }
         updatePropertyBar()
     }
@@ -670,7 +672,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         let v = Self.magnifications[sender.indexOfSelectedItem]; changeStyle { $0.magnification = v }
     }
     @objc func counterSizeChanged(_ sender: NSPopUpButton) {
-        let d = Self.counterSizes[sender.indexOfSelectedItem]; changeStyle(kinds: { $0 == .counter }) { $0.fontSize = d / 2 }
+        let d = Self.counterSizes[sender.indexOfSelectedItem]; changeStyle(kinds: { $0 == .counter }, sizesCounters: true) { $0.fontSize = d / 2 }
     }
 
     @objc func toolClicked(_ sender: NSButton) {
@@ -742,13 +744,13 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     // MARK: Edit menu
 
     @objc func editorUndo(_ sender: Any?) {
-        if let tv = canvas.activeTextView { tv.undoManager?.undo(); return }
+        if let um = canvas.activeTextUndoManager { um.undo(); return }
         guard !canvas.isDragging else { return }
         doc.undo()
     }
 
     @objc func editorRedo(_ sender: Any?) {
-        if let tv = canvas.activeTextView { tv.undoManager?.redo(); return }
+        if let um = canvas.activeTextUndoManager { um.redo(); return }
         guard !canvas.isDragging else { return }
         doc.redo()
     }
@@ -776,7 +778,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
 
     @objc func paste(_ sender: Any?) {
         guard !canvas.isDragging else { return }
-        let pb = NSPasteboard.general
+        let pb = pasteboardForTesting ?? .general
         if pb.changeCount == ElementClipboard.changeCount, !ElementClipboard.elements.isEmpty {
             let offset = 10 * doc.pixelScale
             let copies = ElementClipboard.elements.map { e -> Element in
@@ -789,8 +791,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
             doc.mutate { $0.elements.append(contentsOf: copies) }
             canvas.tool = .select
             canvas.setSelection(Set(copies.map(\.id)))
-        } else if let img = Output.imageFromClipboard() {
-            insertImage(img)
+        } else if let (img, scale) = Output.imageFromClipboardWithScale(pb) {
+            insertImage(img, sourceScale: scale)
         } else {
             NSSound.beep()
         }
@@ -808,15 +810,18 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image]
         panel.beginSheetModal(for: window!) { [weak self] resp in
-            guard resp == .OK, let url = panel.url, let img = ImageExporter.load(from: url) else { return }
-            self?.insertImage(img)
+            guard resp == .OK, let url = panel.url, let loaded = ImageExporter.loadForEditor(from: url) else { return }
+            self?.insertImage(loaded.image, sourceScale: loaded.pixelScale)
         }
     }
 
     /// Drops an image in as a movable, resizable object, scaled down to fit if needed.
-    func insertImage(_ img: CGImage) {
+    /// `sourceScale` is the picture's own pixels per point: it comes in at its real on-screen size,
+    /// so a 1x image in a Retina capture isn't half size, nor a Retina one in a 1x picture double.
+    func insertImage(_ img: CGImage, sourceScale: CGFloat) {
         let canvasSize = doc.state.size
-        var size = CGSize(width: img.width, height: img.height)
+        let k = doc.pixelScale / max(1, sourceScale)
+        var size = CGSize(width: CGFloat(img.width) * k, height: CGFloat(img.height) * k)
         let fit = min(1, canvasSize.width * 0.8 / size.width, canvasSize.height * 0.8 / size.height)
         size = CGSize(width: size.width * fit, height: size.height * fit)
         var e = Element(kind: .image, frame: CGRect(x: (canvasSize.width - size.width) / 2,
@@ -918,8 +923,8 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if canvas.isDragging, let a = item.action, Self.documentChangingActions.contains(a) { return false }
         switch item.action {
-        case #selector(editorUndo(_:)): return canvas.activeTextView != nil || doc.canUndo
-        case #selector(editorRedo(_:)): return canvas.activeTextView != nil || doc.canRedo
+        case #selector(editorUndo(_:)): return canvas.activeTextUndoManager.map(\.canUndo) ?? doc.canUndo
+        case #selector(editorRedo(_:)): return canvas.activeTextUndoManager.map(\.canRedo) ?? doc.canRedo
         case #selector(cut(_:)), #selector(delete(_:)), #selector(duplicateSelection(_:)),
              #selector(bringToFront(_:)), #selector(bringForward(_:)), #selector(sendBackward(_:)),
              #selector(sendToBack(_:)):
