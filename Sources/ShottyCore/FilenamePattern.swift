@@ -73,7 +73,29 @@ public enum FilenamePattern {
         var cleaned = String(s.unicodeScalars.map { bad.contains($0) ? "-" : Character($0) })
         while cleaned.contains("  ") { cleaned = cleaned.replacingOccurrences(of: "  ", with: " ") }
         cleaned = cleaned.trimmingCharacters(in: CharacterSet(charactersIn: " -_."))
-        return String(cleaned.prefix(200))
+        return truncated(cleaned, maxBytes: maxComponentBytes)
+    }
+
+    /// File systems limit a name, not a title: 255 UTF-16 units on APFS/HFS+/exFAT, 255 UTF-8 bytes
+    /// on most network servers. UTF-8 bytes are never fewer than UTF-16 units, so a byte cap fits
+    /// both. 230 leaves room for " (9999)" and ".heic" added by uniqueURL. A Character cap didn't:
+    /// 200 emoji (or flags, or family emoji) are far more than 255 units, and the save failed.
+    public static let maxComponentBytes = 230
+
+    /// The longest start of `s` within `maxBytes` of UTF-8, cut between Characters (never inside
+    /// an emoji or an accented letter).
+    static func truncated(_ s: String, maxBytes: Int) -> String {
+        guard s.utf8.count > maxBytes else { return s }
+        var out = ""
+        var bytes = 0
+        for ch in s {
+            let n = String(ch).utf8.count
+            if bytes + n > maxBytes { break }
+            out.append(ch)
+            bytes += n
+        }
+        // A cut can leave a separator dangling at the end, as an empty variable would.
+        return out.trimmingCharacters(in: CharacterSet(charactersIn: " -_."))
     }
 
     /// "name.png", then "name (2).png", "name (3).png"… — never overwrite an earlier capture.

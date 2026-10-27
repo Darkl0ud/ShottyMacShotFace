@@ -7,6 +7,9 @@ import UniformTypeIdentifiers
 @MainActor
 enum ElementClipboard {
     static var elements: [Element] = []
+    /// The pixels per point of the editor they came from: frames are in document pixels, so a paste
+    /// into an editor of another scale resizes them to keep their on-screen size.
+    static var pixelScale: CGFloat = 1
     static var changeCount = -1
     static let type = NSPasteboard.PasteboardType("com.darkl0ud.shottymacshotface.elements")
 }
@@ -704,9 +707,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         guard let img = flattened() else { return false }
         do {
             if let url = doc.fileURL {
-                try Output.write(img, to: url)
+                try Output.write(img, to: url, pixelScale: doc.pixelScale)
             } else {
-                doc.fileURL = try Output.saveWithPattern(img, title: doc.title, date: doc.captureDate)
+                doc.fileURL = try Output.saveWithPattern(img, title: doc.title, date: doc.captureDate,
+                                                         pixelScale: doc.pixelScale)
             }
             doc.markSaved() // also marks it exported (wasExported)
             updateTitle()
@@ -719,7 +723,7 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
 
     @objc func saveDocumentAs(_ sender: Any?) {
         guard let img = flattened() else { return }
-        Output.saveAs(img, title: doc.title, date: doc.captureDate, window: window) { [weak self] url in
+        Output.saveAs(img, pixelScale: doc.pixelScale, title: doc.title, date: doc.captureDate, window: window) { [weak self] url in
             guard let self, let url else { return }
             self.doc.fileURL = url
             self.doc.markSaved()
@@ -760,11 +764,13 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         let sel = canvas.selectedElements
         guard !sel.isEmpty else { copyImage(sender); return }
         ElementClipboard.elements = sel
-        let pb = NSPasteboard.general
+        ElementClipboard.pixelScale = doc.pixelScale
+        let pb = pasteboardForTesting ?? .general
         pb.clearContents()
         pb.setData(Data(), forType: ElementClipboard.type)
         // Also put a picture of the full capture there, so pasting in other apps still does something.
-        if let img = renderer.flatten(doc.state), let png = try? ImageExporter.data(for: img, format: .png) {
+        if let img = renderer.flatten(doc.state),
+           let png = try? ImageExporter.data(for: img, format: .png, pixelScale: doc.pixelScale) {
             pb.setData(png, forType: .png)
         }
         ElementClipboard.changeCount = pb.changeCount
@@ -781,13 +787,15 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         let pb = pasteboardForTesting ?? .general
         if pb.changeCount == ElementClipboard.changeCount, !ElementClipboard.elements.isEmpty {
             let offset = 10 * doc.pixelScale
+            let k = doc.pixelScale / max(1, ElementClipboard.pixelScale)
             let copies = ElementClipboard.elements.map { e -> Element in
-                var c = e
+                var c = Self.scaled(e, by: k)
                 c.id = UUID()
                 c.move(by: CGPoint(x: offset, y: offset))
                 return c
             }
             ElementClipboard.elements = copies // pasting again cascades instead of stacking
+            ElementClipboard.pixelScale = doc.pixelScale
             doc.mutate { $0.elements.append(contentsOf: copies) }
             canvas.tool = .select
             canvas.setSelection(Set(copies.map(\.id)))
@@ -796,6 +804,16 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
         } else {
             NSSound.beep()
         }
+    }
+
+    /// An annotation resized by `k` (frame and points, about the picture's origin). Styles are in
+    /// points already, so they render at the target's own scale and match the resized shapes.
+    static func scaled(_ e: Element, by k: CGFloat) -> Element {
+        guard k != 1 else { return e }
+        var c = e
+        c.frame = CGRect(x: e.frame.minX * k, y: e.frame.minY * k, width: e.frame.width * k, height: e.frame.height * k)
+        c.points = e.points.map { CGPoint(x: $0.x * k, y: $0.y * k) }
+        return c
     }
 
     @objc func delete(_ sender: Any?) { canvas.deleteSelection() }

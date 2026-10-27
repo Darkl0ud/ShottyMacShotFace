@@ -437,7 +437,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 guard let i = st.elements.firstIndex(where: { $0.id == id }) else { return }
                 // From the mouse-down element, never the previous event's frame: narrowing grows a
                 // text box so no text is hidden, and that growth must go away again on widening.
-                st.elements[i] = Renderer.resizedFittingText(original, h, to: target, pixelScale: s)
+                st.elements[i] = Renderer.resizedFittingText(original, h, to: target, pixelScale: s,
+                                                             canvasTop: st.canvasRect.minY)
             }
         case .rubberBand(let start, _):
             drag = .rubberBand(start: start, current: p)

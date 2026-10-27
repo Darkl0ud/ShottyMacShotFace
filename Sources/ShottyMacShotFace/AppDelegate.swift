@@ -17,7 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var registeredHotkeys: [String: Hotkey] = [:]
     /// Seams for the self-test: how a capture's Save As panel and its editor are shown.
     var presentSaveAs: (CaptureResult, @escaping (URL?) -> Void) -> Void = { r, done in
-        Output.saveAs(r.image, title: r.title, date: r.date, window: nil, completion: done)
+        Output.saveAs(r.image, pixelScale: r.scale, title: r.title, date: r.date, window: nil, completion: done)
     }
     var presentEditor: ((EditorDocument) -> Void)?
     var beep: () -> Void = { NSSound.beep() }
@@ -25,7 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     /// folder or a menu popping up on screen.
     var clipboard: NSPasteboard = .general
     var saveWithPattern: (CaptureResult) throws -> URL = { r in
-        try Output.saveWithPattern(r.image, title: r.title, date: r.date)
+        try Output.saveWithPattern(r.image, title: r.title, date: r.date, pixelScale: r.scale)
     }
     var presentDestinationMenu: ((NSMenu) -> Void)?
 
@@ -407,7 +407,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 state.exported = true
             case .file:
                 do { state.savedURL = try saveWithPattern(r); state.exported = true }
-                catch { Output.showError("Couldn't save the capture", error) }
+                catch {
+                    Output.showError("Couldn't save the capture", error)
+                    // Not done: the Ask menu keeps offering it, so it can be retried once the
+                    // folder is back (an unplugged drive, a permission fixed).
+                    continue
+                }
             default:
                 break
             }

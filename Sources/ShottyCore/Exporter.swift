@@ -44,7 +44,11 @@ public enum ExportError: Error, LocalizedError {
 }
 
 public enum ImageExporter {
-    public static func data(for image: CGImage, format: ImageFormat, quality: Double = 0.9) throws -> Data {
+    /// `pixelScale` is stored as the file's resolution (72 dpi per point, so 144 for Retina). That's
+    /// how loadForEditor, Preview and other apps know a 2x capture is 2x: without it, the app's own
+    /// Retina saves reopened, and were inserted, at twice their on-screen size.
+    public static func data(for image: CGImage, format: ImageFormat, quality: Double = 0.9,
+                            pixelScale: CGFloat = 1) throws -> Data {
         let img: CGImage
         if format.supportsAlpha { img = image }
         else if format == .gif { img = forGIF(image) ?? image }
@@ -54,14 +58,18 @@ public enum ImageExporter {
         else { throw ExportError.encodeFailed(format) }
         var props: [CFString: Any] = [:]
         if format.usesQuality { props[kCGImageDestinationLossyCompressionQuality] = max(0.05, min(1, quality)) }
+        let dpi = 72 * max(1, pixelScale)
+        props[kCGImagePropertyDPIWidth] = dpi
+        props[kCGImagePropertyDPIHeight] = dpi
         CGImageDestinationAddImage(dest, img, props as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { throw ExportError.encodeFailed(format) }
         return out as Data
     }
 
-    public static func write(_ image: CGImage, to url: URL, format: ImageFormat, quality: Double = 0.9) throws {
+    public static func write(_ image: CGImage, to url: URL, format: ImageFormat, quality: Double = 0.9,
+                             pixelScale: CGFloat = 1) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try data(for: image, format: format, quality: quality).write(to: url, options: .atomic)
+        try data(for: image, format: format, quality: quality, pixelScale: pixelScale).write(to: url, options: .atomic)
     }
 
     public static func onWhite(_ image: CGImage) -> CGImage? {

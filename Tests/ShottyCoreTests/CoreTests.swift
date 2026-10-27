@@ -816,3 +816,85 @@ struct Round3EditorTests {
         }
     }
 }
+
+// MARK: Review round 4
+
+struct Round4Tests {
+    func fitted(_ kind: ElementKind, _ text: String, _ frame: CGRect) -> Element {
+        var e = Element(kind: kind, frame: frame)
+        e.text = text
+        return Renderer.fittingText(e, pixelScale: 2)
+    }
+
+    func fits(_ e: Element) -> Bool {
+        let inner = Renderer.textRect(for: e, pixelScale: 2)
+        return inner.height + 0.5 >= Renderer.textHeight(e.text, style: e.style, pixelScale: 2, width: inner.width,
+                                                         center: e.kind == .speechBubble)
+    }
+
+    /// CORE_EDITOR-R4-1: a top corner grip grows the box upwards only as far as the picture's top;
+    /// the rest goes below. With room above, it still keeps the bottom edge (R3-1).
+    @Test func topGripGrowthStopsAtThePictureTop() {
+        let caption = "A caption sentence that is long enough to wrap when narrowed"
+        let start = fitted(.text, caption, CGRect(x: 100, y: 10, width: 480, height: 40))
+        let e = Renderer.resizedFittingText(start, .grip(.topRight), to: CGPoint(x: 300, y: 10), pixelScale: 2)
+        #expect(e.frame.minY >= 0 && e.frame.height > start.frame.height && fits(e), "\(e.frame)")
+        let roomy = fitted(.text, caption, CGRect(x: 100, y: 400, width: 480, height: 40))
+        let up = Renderer.resizedFittingText(roomy, .grip(.topRight), to: CGPoint(x: 300, y: 400), pixelScale: 2)
+        #expect(up.frame.maxY == roomy.frame.maxY && up.frame.minY < roomy.frame.minY && fits(up))
+        // A box already partly above the picture isn't pulled down by the fit, nor pushed further up.
+        let off = fitted(.text, caption, CGRect(x: 100, y: -20, width: 480, height: 40))
+        let o = Renderer.resizedFittingText(off, .grip(.topLeft), to: CGPoint(x: 380, y: -20), pixelScale: 2)
+        #expect(o.frame.minY == -20 && fits(o))
+    }
+
+    /// CORE_EDITOR-R4-1: a bubble whose tail points up keeps the tip outside the body when a top grip
+    /// makes the body grow upwards.
+    @Test func upTailMovesWithTheBody() {
+        var start = fitted(.speechBubble, "Some words in a bubble that wrap", CGRect(x: 300, y: 300, width: 400, height: 100))
+        start.points = [CGPoint(x: 350, y: 240)]
+        let e = Renderer.resizedFittingText(start, .grip(.topRight), to: CGPoint(x: 430, y: 300), pixelScale: 2)
+        #expect(e.frame.minY < start.frame.minY && fits(e))
+        #expect(e.points[0].y < e.frame.minY && !e.frame.contains(e.points[0]), "\(e.frame) tip \(e.points[0])")
+        #expect(start.frame.minY - start.points[0].y == e.frame.minY - e.points[0].y)
+    }
+
+    /// CORE_EDITOR-R4-3: long titles are cut to a byte length every file system takes, between
+    /// Characters, and the file can really be created (with uniqueURL's " (n)" and extension).
+    @Test func longTitlesStillMakeAFile() throws {
+        let dir = tempURL("x").deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let ctx = FilenameContext(date: Date(timeIntervalSince1970: 1_760_000_000), title: "",
+                                  timeZone: TimeZone(identifier: "UTC")!)
+        for unit in ["中", "😀", "🇯🇵", "a"] {
+            var c = ctx
+            c.title = String(repeating: unit, count: 300)
+            let name = FilenamePattern.expand(FilenamePattern.defaultPattern, c)
+            #expect(name.utf8.count <= FilenamePattern.maxComponentBytes, "\(unit): \(name.utf8.count) bytes")
+            #expect(name.hasPrefix("2025-10-09 08.53.20 \(unit)") && name.hasSuffix(unit), "\(unit) cut inside a Character")
+            // The first name is taken, so the file gets " (2)", as a second capture in the same second would.
+            let first = FilenamePattern.uniqueURL(in: dir, relativeName: name, ext: "heic")
+            try Data().write(to: first)
+            let second = FilenamePattern.uniqueURL(in: dir, relativeName: name, ext: "heic")
+            #expect(second.lastPathComponent.contains(" (2)"))
+            try Data().write(to: second)
+        }
+        #expect(FilenamePattern.truncated("ab😀", maxBytes: 5) == "ab")
+    }
+
+    /// CAPTURE_APP-R4-1: a saved 2x capture records 144 dpi, so it reopens (and is inserted) as 2x.
+    @Test func savedScaleRoundTrips() throws {
+        for format in [ImageFormat.png, .jpeg, .tiff, .heic] {
+            let url = tempURL("retina.\(format.fileExtension)")
+            try ImageExporter.write(topRed(40, 40), to: url, format: format, pixelScale: 2)
+            #expect(ImageExporter.loadForEditor(from: url)?.pixelScale == 2, "\(format)")
+            let plain = tempURL("plain.\(format.fileExtension)")
+            try ImageExporter.write(topRed(40, 40), to: plain, format: format)
+            #expect(ImageExporter.loadForEditor(from: plain)?.pixelScale == 1, "\(format)")
+        }
+        let png = try ImageExporter.data(for: topRed(40, 40), format: .png, pixelScale: 2)
+        let src = try #require(CGImageSourceCreateWithData(png as CFData, nil))
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        #expect((props?[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue == 144)
+    }
+}

@@ -55,6 +55,7 @@ Open in the image editor · copy to clipboard · save with the filename pattern 
 (a pop-up menu).
 With Ask each time, copying and saving with the pattern still happen straight away; the menu then offers what's
 left (editor, Save As…), so Editor and Save As ticked alongside it are chosen from the menu.
+If the save with the pattern fails (say the folder is on a disconnected drive), the menu still offers it.
 
 ### Image editor
 | Tool | Key | |
@@ -90,6 +91,8 @@ Notifications after saving also show while the app is in front.
 Filename pattern, e.g. `${YYYY}-${MM}-${DD} ${hh}.${mm}.${ss} ${title}`. Variables: `${YYYY} ${YY} ${MM}
 ${DD} ${hh} ${mm} ${ss} ${title} ${user} ${hostname} ${NUM}`. A `/` creates subfolders. Files are never
 overwritten; a later one becomes `name (2).png`.
+Very long window titles are shortened so the name fits on any disk. Saved pictures keep their Retina
+scale (144 dpi), so they reopen and insert at their on-screen size.
 
 ## Not included (yet)
 Greenshot's printing, e-mail, Office, Imgur/Jira/Confluence/Dropbox exporters, OCR and Internet Explorer

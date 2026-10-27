@@ -269,7 +269,10 @@ public final class Renderer {
     /// began, then grown to fit its text. Each mouse event starts again from `start` rather than
     /// from the previous event's (already grown) frame: so widening back undoes the growth that
     /// narrowing caused, and a bubble's tail can't creep further on every event.
-    public static func resizedFittingText(_ start: Element, _ handle: Handle, to p: CGPoint, pixelScale s: CGFloat) -> Element {
+    /// `canvasTop` is the picture's top edge: growing upwards stops there and the rest goes below,
+    /// because the canvas clips to the picture and a box pushed above it loses its first lines.
+    public static func resizedFittingText(_ start: Element, _ handle: Handle, to p: CGPoint, pixelScale s: CGFloat,
+                                          canvasTop: CGFloat = 0) -> Element {
         var e = start
         e.drag(handle, to: p)
         guard e.kind.hasText, case .grip(let g) = handle else { return e }
@@ -279,13 +282,23 @@ public final class Renderer {
         // so the box grows upwards instead of the bottom being pushed down along with the pointer.
         let fixedY: CGFloat? = [.topLeft, .top, .topRight].contains(g) ? start.frame.maxY
             : [.bottomLeft, .bottom, .bottomRight].contains(g) ? start.frame.minY : nil
-        if let y = fixedY, abs(dragged.maxY - y) < 0.001 { f.origin.y = dragged.maxY - f.height }
+        if let y = fixedY, abs(dragged.maxY - y) < 0.001 {
+            // Never above the picture's top, unless the box (or the pointer) was already there.
+            let highest = min(canvasTop, start.frame.minY, dragged.minY)
+            f.origin.y = max(highest, dragged.maxY - f.height)
+        }
         e.frame = f
         // The tail keeps pointing where it did; only the fit pushing the body past both its start
-        // bottom and where the pointer put it moves the tip, so the body can't swallow its own tail.
-        if e.kind == .speechBubble, let tip = start.points.first, tip.y >= start.frame.maxY {
-            let push = f.maxY - max(start.frame.maxY, dragged.maxY)
-            if push > 0 { e.points[0] = CGPoint(x: tip.x, y: tip.y + push) }
+        // edge and where the pointer put it moves the tip, so the body can't swallow its own tail.
+        // A tail below the body is pushed down, one above it (the body grew upwards) up.
+        if e.kind == .speechBubble, let tip = start.points.first {
+            if tip.y >= start.frame.maxY {
+                let push = f.maxY - max(start.frame.maxY, dragged.maxY)
+                if push > 0 { e.points[0] = CGPoint(x: tip.x, y: tip.y + push) }
+            } else if tip.y <= start.frame.minY {
+                let push = min(start.frame.minY, dragged.minY) - f.minY
+                if push > 0 { e.points[0] = CGPoint(x: tip.x, y: tip.y - push) }
+            }
         }
         return e
     }
