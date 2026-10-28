@@ -92,7 +92,8 @@ Filename pattern, e.g. `${YYYY}-${MM}-${DD} ${hh}.${mm}.${ss} ${title}`. Variabl
 ${DD} ${hh} ${mm} ${ss} ${title} ${user} ${hostname} ${NUM}`. A `/` creates subfolders. Files are never
 overwritten; a later one becomes `name (2).png`.
 Very long window titles are shortened so the name fits on any disk. Saved pictures keep their Retina
-scale (144 dpi), so they reopen and insert at their on-screen size.
+scale (144 dpi), so they reopen and insert at their on-screen size — except GIF, which can't store a
+resolution and so reopens at 1x (double size for a Retina capture).
 
 ## Not included (yet)
 Greenshot's printing, e-mail, Office, Imgur/Jira/Confluence/Dropbox exporters, OCR and Internet Explorer

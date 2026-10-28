@@ -37,10 +37,19 @@ final class SelfTest: NSObject, NSApplicationDelegate {
 
     private func note(_ s: String) { lines.append("INFO " + s) }
 
-    private func save(_ img: CGImage?, _ name: String) {
+    /// CAPTURE_APP-R5-3: every artifact states its render's scale (no default, so a new call site
+    /// can't forget it), and report images open in Preview at their on-screen size.
+    private func save(_ img: CGImage?, _ name: String, scale: CGFloat) {
         guard let img else { check(false, "\(name): no image"); return }
-        do { try ImageExporter.write(img, to: out.appendingPathComponent(name), format: .png) }
+        do { try ImageExporter.write(img, to: out.appendingPathComponent(name), format: .png, pixelScale: scale) }
         catch { check(false, "\(name): \(error.localizedDescription)") }
+    }
+
+    /// Headless view snapshots come back at the rep's own density (usually 1x without a screen),
+    /// so the scale is measured rather than assumed.
+    private func saveSnapshot(_ v: NSView, _ name: String) {
+        let img = snapshotView(v)
+        save(img, name, scale: img.map { CGFloat($0.width) / max(1, v.bounds.width) } ?? 1)
     }
 
     private func snapshotView(_ v: NSView) -> CGImage? {
@@ -125,7 +134,7 @@ final class SelfTest: NSObject, NSApplicationDelegate {
         // 1. Every annotation rendered.
         var flat: CGImage?
         let ms = time { flat = renderer.flatten(doc.state) }
-        save(flat, "01-annotations.png")
+        save(flat, "01-annotations.png", scale: 2)
         check(flat?.width == 1600 && flat?.height == 1000, "flatten keeps size (1600×1000), took \(Int(ms)) ms")
         if let flat, let px = PixelReader(flat) {
             // The pixelated password line must not match the original pixels.
@@ -168,7 +177,8 @@ final class SelfTest: NSObject, NSApplicationDelegate {
         ]
         for (name, img) in effects {
             check(img != nil, "effect \(name)")
-            save(img.flatMap { Effects.resize($0, width: $0.width / 2, height: $0.height / 2) }, "02-effect-\(name).png")
+            // Halved for the report: half the pixels of a 2x render is 1 pixel per point.
+            save(img.flatMap { Effects.resize($0, width: $0.width / 2, height: $0.height / 2) }, "02-effect-\(name).png", scale: 1)
         }
 
         // 4. The real editor window, rendered offscreen in a few states.
@@ -178,14 +188,14 @@ final class SelfTest: NSObject, NSApplicationDelegate {
         if let content = ed.window?.contentView {
             note("editor window \(ed.window!.frame), content \(content.frame), canvas \(ed.canvas.frame), scroll \(ed.canvas.enclosingScrollView?.frame ?? .zero)")
             ed.canvas.setSelection([doc.state.elements[3].id])
-            save(snapshotView(content), "03-editor-select.png")
+            saveSnapshot(content, "03-editor-select.png")
             ed.canvas.tool = .draw(.text)
-            save(snapshotView(content), "03-editor-text-tool.png")
+            saveSnapshot(content, "03-editor-text-tool.png")
             ed.canvas.tool = .draw(.obfuscate)
-            save(snapshotView(content), "03-editor-obfuscate-tool.png")
+            saveSnapshot(content, "03-editor-obfuscate-tool.png")
             ed.canvas.tool = .crop
             ed.canvas.setCropRect(CGRect(x: 180, y: 140, width: 1100, height: 700))
-            save(snapshotView(content), "03-editor-crop.png")
+            saveSnapshot(content, "03-editor-crop.png")
             ed.canvas.applyCrop()
             check(doc.state.image.width == 1100 && doc.state.image.height == 700, "crop applied (1100×700)")
             doc.undo()
@@ -268,6 +278,10 @@ final class SelfTest: NSObject, NSApplicationDelegate {
         Round3AppChecks.run(check: { self.check($0, $1) }, note: { self.note($0) })
         // Review round 4 (one fixer): editor and app checks together.
         Round4Checks.run(check: { self.check($0, $1) }, note: { self.note($0) })
+        Round5Checks.run(check: { self.check($0, $1) }, note: { self.note($0) })
+        // CAPTURE_APP-R5-3: the 2x artifact written above must reopen as 2x (save() takes the scale).
+        Round5Checks.artifactKeepsScale(out.appendingPathComponent("01-annotations.png"),
+                                        { self.check($0, $1) })
 
         // 4a. Opening size: a wide, short capture (2313×233 px @2x, like a strip of text) should give
         // a window about as wide as the picture plus the side palette, and tall enough for every tool.
@@ -333,7 +347,7 @@ final class SelfTest: NSObject, NSApplicationDelegate {
                 Bitmap.drawImage(snapImage, in: full, ctx: ctx)
                 if let dim { Bitmap.drawImage(dim, in: full, ctx: ctx) }
                 if let layer { Bitmap.drawImage(layer, in: full, ctx: ctx) }
-            }, name)
+            }, name, scale: 2) // 1600×1000 px for an 800×500 pt overlay: a 2x composite
         }
         let probe = SelectionOverlay(snapshot: snap, mode: .region, showMagnifier: false)
         do {
@@ -371,7 +385,7 @@ final class SelfTest: NSObject, NSApplicationDelegate {
         let host = NSHostingView(rootView: SettingsView(store: SettingsStore.shared))
         let sw = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 592, height: 462), styleMask: [.titled], backing: .buffered, defer: false)
         sw.contentView = host
-        save(snapshotView(host), "05-preferences.png")
+        saveSnapshot(host, "05-preferences.png")
 
         // 7. Hotkeys can be registered (then released again so a running copy isn't disturbed).
         let errors = HotkeyManager.shared.register(AppSettings())
@@ -392,19 +406,20 @@ final class SelfTest: NSObject, NSApplicationDelegate {
                   "every display captured at its own native size (\(shot.parts.count) displays, \(ms) ms, concurrently)")
             if let full = shot.capture(shot.frame) {
                 check(full.image.width == Int((shot.frame.width * full.scale).rounded()), "full-screen capture \(full.image.width)×\(full.image.height) px, scale \(full.scale)")
-                save(Effects.resize(full.image, width: full.image.width / 3, height: full.image.height / 3), "06-fullscreen-third.png")
+                // A third of the pixels is a thumbnail, nearest to 1 pixel per point on a 2x screen.
+                save(Effects.resize(full.image, width: full.image.width / 3, height: full.image.height / 3), "06-fullscreen-third.png", scale: 1)
             } else { check(false, "full-screen capture") }
             note("windows found: \(shot.windows.count): " + shot.windows.prefix(6).map(\.displayTitle).joined(separator: " | "))
             if let w = shot.windows.first(where: { $0.scWindow != nil }) {
                 cap.includeWindowShadow = true
                 let (img, wScale) = try await cap.captureWindow(w)
                 note("window capture scale \(wScale)")
-                save(img, "06-window-shadow.png")
+                save(img, "06-window-shadow.png", scale: wScale)
                 let corner = PixelReader(img)?[0, 0]
                 note("window '\(w.displayTitle)' frame \(w.frame.size) → \(img.width)×\(img.height) px, corner alpha \(corner?.a ?? 255)")
                 cap.includeWindowShadow = false
-                let plain = try await cap.captureWindow(w).image
-                save(plain, "06-window-plain.png")
+                let (plain, plainScale) = try await cap.captureWindow(w)
+                save(plain, "06-window-plain.png", scale: plainScale)
                 check(plain.width <= img.width, "window capture without shadow is not larger (\(plain.width) ≤ \(img.width))")
                 // The window inside the shadow capture must be full size, not shrunk to make room.
                 if let px = PixelReader(img) {

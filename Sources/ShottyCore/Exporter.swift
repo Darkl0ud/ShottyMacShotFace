@@ -44,9 +44,12 @@ public enum ExportError: Error, LocalizedError {
 }
 
 public enum ImageExporter {
-    /// `pixelScale` is stored as the file's resolution (72 dpi per point, so 144 for Retina). That's
-    /// how loadForEditor, Preview and other apps know a 2x capture is 2x: without it, the app's own
-    /// Retina saves reopened, and were inserted, at twice their on-screen size.
+    /// `pixelScale` is stored as the file's resolution (72 dpi per point: 144 for 2x, 216 for 3x,
+    /// the same steps `pixelScale(dpi:)` reads back). That's how loadForEditor, Preview and other
+    /// apps know a 2x capture is 2x: without it, the app's own Retina saves reopened, and were
+    /// inserted, at twice their on-screen size. GIF is the one format that can't hold this: it has
+    /// no resolution field, so ImageIO drops the properties and a GIF always reopens at 1x
+    /// (pinned by the gifCannotStoreScaleButBMPCan test and said in the README).
     public static func data(for image: CGImage, format: ImageFormat, quality: Double = 0.9,
                             pixelScale: CGFloat = 1) throws -> Data {
         let img: CGImage
@@ -122,9 +125,12 @@ public enum ImageExporter {
     }
 
     /// One rule for every image source (files and the clipboard), so a picture means the same
-    /// size wherever it comes from. 144 dpi is Retina; 140 leaves room for rounding in the file.
+    /// size wherever it comes from. The write side stores 72 dpi per point (144 for 2x, 216 for
+    /// 3x), and each threshold sits under its step to leave room for rounding in the file.
+    /// Anything denser than 216 still reads as 3x: the densest scale any screen (or our writer)
+    /// produces, so clipboard and file reads stay clamped to 1...3.
     public static func pixelScale(dpi: CGFloat) -> CGFloat {
-        dpi >= 140 ? 2 : 1
+        dpi >= 200 ? 3 : dpi >= 140 ? 2 : 1
     }
 
     static func orientedImage(_ src: CGImageSource) -> CGImage? {

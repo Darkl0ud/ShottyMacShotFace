@@ -773,7 +773,9 @@ struct Round3EditorTests {
         #expect(ImageExporter.pixelScale(dpi: 72) == 1)
         #expect(ImageExporter.pixelScale(dpi: 139.9) == 1)
         #expect(ImageExporter.pixelScale(dpi: 144) == 2)
-        #expect(ImageExporter.pixelScale(dpi: 300) == 2)
+        #expect(ImageExporter.pixelScale(dpi: 199.9) == 2)
+        #expect(ImageExporter.pixelScale(dpi: 216) == 3)
+        #expect(ImageExporter.pixelScale(dpi: 600) == 3)
     }
 
     /// CORE_EDITOR-R3-1: every event works from the drag-start element, so the growth goes away again.
@@ -896,5 +898,33 @@ struct Round4Tests {
         let src = try #require(CGImageSourceCreateWithData(png as CFData, nil))
         let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
         #expect((props?[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue == 144)
+    }
+}
+
+// MARK: Review round 5
+
+struct Round5Tests {
+    /// CORE_EDITOR-R5-1 / CAPTURE_APP-R5-1: GIF has no resolution field, so ImageIO drops the
+    /// 144 dpi and a 2x GIF reopens at 1x — the README says so. BMP does store it (as pixels per
+    /// meter, 143.99 dpi, still past the 140 threshold). This test pins both, so if an ImageIO
+    /// update ever changes either, it fails and the README line gets revisited.
+    @Test func gifCannotStoreScaleButBMPCan() throws {
+        let gif = tempURL("r5-scale.gif")
+        try ImageExporter.write(topRed(40, 40), to: gif, format: .gif, pixelScale: 2)
+        #expect(ImageExporter.loadForEditor(from: gif)?.pixelScale == 1)
+        let src = try #require(CGImageSourceCreateWithURL(gif as CFURL, nil))
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        #expect(props?[kCGImagePropertyDPIWidth] == nil, "GIF grew a resolution field: revisit the README's GIF caveat")
+        let bmp = tempURL("r5-scale.bmp")
+        try ImageExporter.write(topRed(40, 40), to: bmp, format: .bmp, pixelScale: 2)
+        #expect(ImageExporter.loadForEditor(from: bmp)?.pixelScale == 2)
+    }
+
+    /// CORE_EDITOR-R5-2: the write side stores 72 dpi per point for ANY scale, so the read side
+    /// must give 3x back for a 3x file instead of quantizing everything dense to 2x.
+    @Test func threeXScaleRoundTrips() throws {
+        let url = tempURL("r5-3x.png")
+        try ImageExporter.write(topRed(40, 40), to: url, format: .png, pixelScale: 3)
+        #expect(ImageExporter.loadForEditor(from: url)?.pixelScale == 3)
     }
 }

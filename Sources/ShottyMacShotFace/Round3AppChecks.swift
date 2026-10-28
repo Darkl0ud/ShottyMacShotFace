@@ -100,7 +100,7 @@ enum Round3AppChecks {
             let url = dir.appendingPathComponent("\(Int(dpi)).tiff")
             try? data.write(to: url)
             let file = ImageExporter.loadForEditor(from: url)?.pixelScale ?? 0
-            let want: CGFloat = dpi >= 140 ? 2 : 1
+            let want: CGFloat = dpi >= 200 ? 3 : dpi >= 140 ? 2 : 1
             if clip != file || clip != want { mismatches.append("\(Int(dpi)) dpi: clipboard \(clip), file \(file)") }
         }
         check(mismatches.isEmpty, "CA-R3-2: clipboard scale = Open Image from File scale at 72…600 dpi (\(mismatches))")

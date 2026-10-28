@@ -790,6 +790,10 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate, Canvas
             let k = doc.pixelScale / max(1, ElementClipboard.pixelScale)
             let copies = ElementClipboard.elements.map { e -> Element in
                 var c = Self.scaled(e, by: k)
+                // Fonts don't rasterize linearly across pixel scales: a box fitted at the source
+                // scale can be a hair too short for its text here, and drawText would clip the
+                // last line. Re-fit at this document's scale (moves a bubble's down tail along).
+                if k != 1, c.kind.hasText { c = Renderer.fittingText(c, pixelScale: doc.pixelScale) }
                 c.id = UUID()
                 c.move(by: CGPoint(x: offset, y: offset))
                 return c

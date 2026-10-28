@@ -483,7 +483,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     @objc func destinationChosen(_ sender: NSMenuItem) {
         guard let choice = sender.representedObject as? DestinationChoice, let d = choice.destination else { return }
-        run([d], choice.result, after: choice.prior)
+        let after = run([d], choice.result, after: choice.prior)
+        // A pattern save that failed AGAIN: the menu that offered it is already dismissed and the
+        // capture travels only with its items, so without a new menu the capture would be freed
+        // with no way left to retry, open the editor or Save As. Show the menu again.
+        if d == .file, !after.done.contains(.file) { showDestinationMenu(choice.result, after: after) }
     }
 
     // MARK: Editors
