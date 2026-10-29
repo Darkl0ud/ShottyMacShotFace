@@ -413,7 +413,7 @@ func isBlack(_ p: PixelReader.Pixel) -> Bool { p.r < 20 && p.g < 20 && p.b < 20 
 @Suite struct FilenameTests {
     let ctx = FilenameContext(
         date: Date(timeIntervalSince1970: 1_760_000_000), // 2025-10-09 08:53:20 UTC
-        title: "Safari: Apple / News", user: "warren", host: "mbp", counter: 7,
+        title: "Safari: Apple / News", user: "alice", host: "laptop", counter: 7,
         timeZone: TimeZone(identifier: "UTC")!)
 
     @Test func defaultPattern() {
@@ -427,7 +427,7 @@ func isBlack(_ p: PixelReader.Pixel) -> Bool { p.r < 20 && p.g < 20 && p.b < 20 
 
     @Test func subfoldersButNoEscape() {
         #expect(FilenamePattern.expand("${YYYY}/${MM}/shot_${NUM}", ctx) == "2025/10/shot_000007")
-        #expect(FilenamePattern.expand("../../etc/${user}", ctx) == "etc/warren")
+        #expect(FilenamePattern.expand("../../etc/${user}", ctx) == "etc/alice")
         #expect(FilenamePattern.expand("${title}", ctx).contains("/") == false)
     }
 

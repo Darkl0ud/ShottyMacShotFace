@@ -83,10 +83,10 @@ final class SelfTest: NSObject, NSApplicationDelegate {
                 ctx.fillEllipse(in: CGRect(x: win.minX + (12 + CGFloat(i) * 20) * s, y: win.minY + 8 * s, width: 12 * s, height: 12 * s))
             }
             let text = """
-            Server: proxmox-01.lab.local   Status: OK
+            Server: server-01.example.com   Status: OK
             Password: hunter2-very-secret
             Uptime: 42 days, 3:14   Load: 0.21 0.18 0.12
-            ZFS pool 'tank' ONLINE — 3 × 8 TB raidz1
+            Disk: /dev/sda1  ONLINE — 512 GB, 61% used
             """
             let str = NSAttributedString(string: text, attributes: [
                 .font: NSFont.monospacedSystemFont(ofSize: 13 * s, weight: .regular), .foregroundColor: NSColor.black,
@@ -328,7 +328,7 @@ final class SelfTest: NSObject, NSApplicationDelegate {
         // 5. Selection overlay mid-drag with magnifier, and window-hover mode.
         let snapImage = Self.sampleImage(width: 1600, height: 1000, scale: 2)
         let fakeWindow = WindowInfo(windowID: 1, frame: CGRect(x: 100, y: 80, width: 520, height: 320),
-                                    title: "Terminal — ssh proxmox", appName: "Terminal", scWindow: nil)
+                                    title: "Terminal — ssh server-01", appName: "Terminal", scWindow: nil)
         let snap = ScreenSnapshot(image: snapImage, frame: CGRect(x: 0, y: 0, width: 800, height: 500), scale: 2,
                                   displays: [], windows: [fakeWindow])
         for (name, mode, drag) in [("04-overlay-region-drag.png", SelectionOverlay.Mode.region, true),

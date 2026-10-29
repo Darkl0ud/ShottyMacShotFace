@@ -114,7 +114,7 @@ final class SelectionOverlay {
     static let precisionFactor: CGFloat = 0.25
     static let chordModifiers: NSEvent.ModifierFlags = [.shift, .control, .option, .command]
 
-    /// The real pointer and keyboard state, behind closures so the self-test never touches Warren's mouse.
+    /// The real pointer and keyboard state, behind closures so the self-test never touches the user's mouse.
     struct Pointer {
         var warp: (CGPoint) -> Void = { CGWarpMouseCursorPosition($0) }
         /// false = the on-screen pointer stops following the mouse; movement still arrives as deltas.
